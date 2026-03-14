@@ -36,3 +36,15 @@ asyncaiflow:
   queue:
     lock-ttl-seconds: 300
     heartbeat-ttl-seconds: 60
+  worker:
+    heartbeat-timeout-seconds: 90
+  action:
+    default-max-retry-count: 3
+    default-backoff-seconds: 5
+    default-execution-timeout-seconds: 300
+  dispatch:
+    capability-mapping:
+      analyze_module: read_file
+  scheduler:
+    action-scan-fixed-delay-ms: 2000
+    worker-scan-fixed-delay-ms: 10000

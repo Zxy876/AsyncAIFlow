@@ -31,7 +31,12 @@ public class ActionQueueService {
     private long heartbeatTtlSeconds;
 
     public void enqueue(ActionEntity action) {
-        redisTemplate.opsForList().leftPush(queueKey(action.getType()), action.getId().toString());
+        enqueue(action, action.getType());
+    }
+
+    public void enqueue(ActionEntity action, String capability) {
+        String queueCapability = (capability == null || capability.isBlank()) ? action.getType() : capability;
+        redisTemplate.opsForList().leftPush(queueKey(queueCapability), action.getId().toString());
     }
 
     public Optional<Long> claimNextAction(List<String> capabilities, String workerId) {
@@ -60,6 +65,13 @@ public class ActionQueueService {
 
     public void releaseLock(Long actionId) {
         redisTemplate.delete(lockKey(actionId));
+    }
+
+    public void refreshActionLock(Long actionId, String workerId, long ttlSeconds) {
+        String currentOwner = redisTemplate.opsForValue().get(lockKey(actionId));
+        if (workerId.equals(currentOwner)) {
+            redisTemplate.expire(lockKey(actionId), Duration.ofSeconds(Math.max(1L, ttlSeconds)));
+        }
     }
 
     public void refreshHeartbeat(String workerId) {

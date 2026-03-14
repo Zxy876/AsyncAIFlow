@@ -16,7 +16,7 @@ public class WorkerEntity {
 
     private String status;
 
-    private LocalDateTime lastHeartbeat;
+    private LocalDateTime lastHeartbeatAt;
 
     private LocalDateTime createdAt;
 
@@ -46,12 +46,12 @@ public class WorkerEntity {
         this.status = status;
     }
 
-    public LocalDateTime getLastHeartbeat() {
-        return lastHeartbeat;
+    public LocalDateTime getLastHeartbeatAt() {
+        return lastHeartbeatAt;
     }
 
-    public void setLastHeartbeat(LocalDateTime lastHeartbeat) {
-        this.lastHeartbeat = lastHeartbeat;
+    public void setLastHeartbeatAt(LocalDateTime lastHeartbeatAt) {
+        this.lastHeartbeatAt = lastHeartbeatAt;
     }
 
     public LocalDateTime getCreatedAt() {

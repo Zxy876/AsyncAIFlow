@@ -15,6 +15,7 @@ import com.asyncaiflow.support.ApiException;
 import com.asyncaiflow.support.JsonCodec;
 import com.asyncaiflow.web.dto.RegisterWorkerRequest;
 import com.asyncaiflow.web.dto.WorkerResponse;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 
 @Service
 public class WorkerService {
@@ -48,7 +49,7 @@ public class WorkerService {
 
         worker.setCapabilities(jsonCodec.write(normalizedCapabilities));
         worker.setStatus(WorkerStatus.ONLINE.name());
-        worker.setLastHeartbeat(now);
+        worker.setLastHeartbeatAt(now);
         worker.setUpdatedAt(now);
 
         if (isNewWorker) {
@@ -74,11 +75,33 @@ public class WorkerService {
         WorkerEntity worker = requireWorker(workerId);
         LocalDateTime now = LocalDateTime.now();
         worker.setStatus(WorkerStatus.ONLINE.name());
-        worker.setLastHeartbeat(now);
+        worker.setLastHeartbeatAt(now);
         worker.setUpdatedAt(now);
         workerMapper.updateById(worker);
         actionQueueService.refreshHeartbeat(workerId);
         return worker;
+    }
+
+    @Transactional
+    public WorkerResponse heartbeat(String workerId) {
+        return toResponse(touchHeartbeat(workerId));
+    }
+
+    @Transactional
+    public int markStaleWorkers(long heartbeatTimeoutSeconds) {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime staleThreshold = now.minusSeconds(Math.max(1L, heartbeatTimeoutSeconds));
+        List<WorkerEntity> staleCandidates = workerMapper.selectList(new LambdaQueryWrapper<WorkerEntity>()
+                .eq(WorkerEntity::getStatus, WorkerStatus.ONLINE.name())
+                .isNotNull(WorkerEntity::getLastHeartbeatAt)
+                .lt(WorkerEntity::getLastHeartbeatAt, staleThreshold));
+
+        for (WorkerEntity worker : staleCandidates) {
+            worker.setStatus(WorkerStatus.STALE.name());
+            worker.setUpdatedAt(now);
+            workerMapper.updateById(worker);
+        }
+        return staleCandidates.size();
     }
 
     public List<String> readCapabilities(WorkerEntity worker) {
@@ -90,11 +113,14 @@ public class WorkerService {
                 worker.getId(),
                 readCapabilities(worker),
                 worker.getStatus(),
-                worker.getLastHeartbeat()
+                worker.getLastHeartbeatAt()
         );
     }
 
     private List<String> normalizeCapabilities(List<String> capabilities) {
+        if (capabilities == null) {
+            return List.of();
+        }
         return capabilities.stream()
                 .filter(capability -> capability != null && !capability.isBlank())
                 .map(String::trim)

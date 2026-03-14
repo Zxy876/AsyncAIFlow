@@ -7,6 +7,6 @@ public record WorkerResponse(
         String workerId,
         List<String> capabilities,
         String status,
-        LocalDateTime lastHeartbeat
+        LocalDateTime lastHeartbeatAt
 ) {
 }
