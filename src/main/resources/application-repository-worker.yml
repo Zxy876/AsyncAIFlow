@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: asyncaiflow-repository-worker
+
+logging:
+  level:
+    com.asyncaiflow.worker: INFO
+
+asyncaiflow:
+  repository-worker:
+    server-base-url: http://localhost:8080
+    worker-id: repository-worker-1
+    capabilities:
+      - search_code
+      - read_file
+    poll-interval-millis: 2000
+    heartbeat-interval-millis: 10000
+    max-actions: 0
+    validation:
+      mode: warn
+      schema-base-path: schemas/v1
+    repository:
+      workspace-root: .
+      max-search-results: 40
+      max-read-bytes: 65536
+      ignored-directories:
+        - .git
+        - .idea
+        - .aiflow
+        - target
+        - build
+        - node_modules
