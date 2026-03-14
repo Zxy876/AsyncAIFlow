@@ -152,20 +152,17 @@ This is the minimal closed loop needed to prove that AsyncAIFlow can coordinate 
 
 ## 5. Worker capability model
 
-Dispatch rule in v0.1:
+Dispatch baseline in v0.2:
 
-- One Redis queue per action type.
-- Worker registers capabilities in MySQL.
-- Worker poll loads its capabilities.
-- Flow Server scans capability-specific queues in order.
-- First claimable action is assigned to the worker.
+- actionType resolves to requiredCapability (default same-name)
+- optional mapping override via `asyncaiflow.dispatch.capability-mapping`
+- one Redis queue per required capability
+- worker poll scans queues by worker capability set
+- claim re-checks required capability before RUNNING assignment
 
-This model is deliberately simple and works well for early agent orchestration because:
+This minimal formalization keeps dispatch behavior explicit, testable, and backward compatible with same-name action types.
 
-- action types are explicit;
-- worker eligibility is transparent;
-- routing is easy to debug;
-- later priority rules can be added without rewriting the whole model.
+Detailed spec is in [docs/worker-capability-model.md](docs/worker-capability-model.md).
 
 ## 6. MySQL schema in v0.1
 
@@ -225,41 +222,105 @@ Foundation:
 
 ### Phase 2
 
-Dispatch improvements:
+Runtime reliability:
 
 - better capability matching
 - queue fairness
 - retry queue
 - heartbeat timeout detection
 - worker lease recovery
+- dead-letter handling
+- lease renewal observability
 
 ### Phase 3
 
-DAG orchestration:
+Planner, CLI, and observability:
+
+- planner preview API
+- `aiflow issue`, `aiflow plan`, `aiflow run`, `aiflow status`
+- `GET /workflows`
+- `GET /workflow/{id}`
+- `GET /workflow/{id}/actions`
+- `GET /action/{id}`
+
+This phase makes the system observable and usable from terminal, even before richer worker capabilities arrive.
+
+### Phase 4
+
+Worker Milestone 1: minimum closed loop:
+
+- `generate_explanation` as existing LLM worker
+- `search_code`
+- `read_file`
+
+Target flow:
+
+```text
+issue
+  -> search_code
+  -> read_file
+  -> generate_explanation
+```
+
+This is the first point where AsyncAIFlow becomes a real explain-and-debug loop instead of a planner demo.
+
+### Phase 5
+
+Interactive ASCII CLI:
+
+- `aiflow interactive`
+- new issue prompt
+- plan preview
+- run confirmation
+- recent workflow list
+- workflow status view
+- action detail view
+
+Status: implemented.
+
+The ASCII UI should come after Worker Milestone 1 so the terminal experience wraps a real execution loop rather than an empty shell.
+
+### Phase 6
+
+Worker Milestone 2: code change loop:
+
+- `write_file`
+- `run_tests`
+
+Target flow:
+
+```text
+issue
+  -> search_code
+  -> read_file
+  -> generate_explanation
+  -> write_file
+  -> run_tests
+```
+
+This is the first milestone where AsyncAIFlow can move from explanation into code modification and verification.
+
+### Phase 7
+
+Extended worker system:
 
 - richer dependency conditions
 - retry policy
 - action timeout
 - workflow-level completion hooks
 
-### Phase 4
-
-Context builder:
-
 - repo graph extraction
 - diff context builder
 - issue context builder
 - test context builder
-
-### Phase 5
-
-Agent integration:
 
 - GPT worker
 - Copilot worker
 - Zread worker
 - test worker
 - MCP tool-backed execution contracts
+
+- future workers such as `git_diff`, `review_code`, `generate_patch`, `trace_execution`
 
 ## 10. v0.1 success criteria
 
@@ -272,3 +333,72 @@ v0.1 is successful if it can do these five things reliably:
 5. Trigger next action when dependencies are satisfied.
 
 That is the correct minimum for AsyncAIFlow because it proves the core abstraction: the system schedules actions, and workers are interchangeable executors behind that contract.
+
+## 11. Current product status
+
+The system is no longer just a runtime skeleton. It now has six concrete layers:
+
+- Planner: issue -> plan preview
+- Runtime: workflow and action DAG execution
+- Worker: `generate_explanation`
+- Repository worker: `search_code`, `read_file`, and `analyze_module` compatibility via capability mapping
+- CLI: `aiflow issue`, `aiflow plan`, `aiflow run`, `aiflow status`
+- Interactive CLI: `aiflow interactive`
+- Observability: workflow list, workflow status, action detail
+
+Reliability and execution behavior already exceed the original v0.1 baseline:
+
+- lease assignment, timeout reclaim, retry/backoff, dead-letter
+- worker heartbeat and stale detection
+- lease renewal during long-running execution
+- worker-side runtime schema validation with off/warn/strict modes
+- integration-style behavior contract tests for schema validation and lease flow
+
+Observability is now available through stable read-only APIs:
+
+- `GET /workflows`
+- `GET /workflow/{id}`
+- `GET /workflow/{id}/actions`
+- `GET /action/{id}`
+
+Worker Milestone 1 is now implemented:
+
+- `search_code`
+- `read_file`
+- planner-compatible `analyze_module -> read_file` capability mapping
+- execution contract tests proving `search_code -> analyze_module -> generate_explanation` can complete as a DAG
+
+Lease renewal observability baseline is now tracked per action:
+
+- claim_time
+- first_renew_time
+- last_renew_time
+- submit_time
+- reclaim_time
+
+- lease_renew_success_count
+- lease_renew_failure_count
+- last_lease_renew_at
+- execution_started_at
+- last_execution_duration_ms
+- last_reclaim_reason
+
+Near-term priorities:
+
+1. Keep runtime scheduling, planner logic, and worker execution model stable while worker capability surface expands.
+2. Add `write_file` and `run_tests` as Worker Milestone 2.
+3. Decide whether to add `list_files` before or alongside Worker Milestone 2.
+
+Experience threshold:
+
+The first real end-to-end product experience happens when these three conditions are true:
+
+1. CLI is stable.
+2. Observability APIs are stable.
+3. Worker Milestone 1 is complete.
+
+Those conditions are now satisfied for the explain/debug loop, and the ASCII UI has been added so the system is directly usable by a human operator from terminal.
+
+Planner architecture reference:
+
+- [docs/planner-architecture.md](docs/planner-architecture.md)

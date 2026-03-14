@@ -1,0 +1,1013 @@
+#!/usr/bin/env python3
+"""AsyncAIFlow developer CLI."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+CONFIG_DIR_NAME = ".aiflow"
+CONFIG_FILE_NAME = "config.json"
+LAST_PLAN_FILE_NAME = "last-plan.json"
+LAST_RUN_FILE_NAME = "last-run.json"
+
+DEFAULT_CONFIG = {
+    "openai_api_key": "",
+    "deepseek_api_key": "",
+    "runtime_url": "http://localhost:8080",
+}
+
+
+class CliError(Exception):
+    """Known command execution error."""
+
+
+def current_timestamp() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def find_initialized_root(start: pathlib.Path) -> pathlib.Path | None:
+    for candidate in [start, *start.parents]:
+        config_file = candidate / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+        if config_file.exists():
+            return candidate
+    return None
+
+
+def require_initialized_root() -> pathlib.Path:
+    root = find_initialized_root(pathlib.Path.cwd())
+    if root is None:
+        raise CliError("Project is not initialized. Run 'aiflow init' in your project root first.")
+    return root
+
+
+def read_json_file(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise CliError(f"File not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def write_json_file(path: pathlib.Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def config_path(project_root: pathlib.Path) -> pathlib.Path:
+    return project_root / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+
+
+def load_config(project_root: pathlib.Path) -> dict[str, Any]:
+    config_file = project_root / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+    if not config_file.exists():
+        raise CliError("Missing .aiflow/config.json. Run 'aiflow init' first.")
+
+    loaded = read_json_file(config_file)
+    merged = dict(DEFAULT_CONFIG)
+    merged.update({k: v for k, v in loaded.items() if k in DEFAULT_CONFIG})
+    return merged
+
+
+def runtime_url_from_config(config: dict[str, Any]) -> str:
+    value = str(config.get("runtime_url", "")).strip()
+    if not value:
+        raise CliError("runtime_url is empty in .aiflow/config.json")
+    return value.rstrip("/")
+
+
+def decode_body(raw: bytes) -> tuple[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return "", None
+    try:
+        return text, json.loads(text)
+    except json.JSONDecodeError:
+        return text, text
+
+
+def http_json(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout_seconds: int = 20,
+    allow_http_error: bool = False,
+) -> tuple[int, Any]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body_text, body_json = decode_body(response.read())
+            _ = body_text
+            return response.getcode(), body_json
+    except urllib.error.HTTPError as exc:
+        body_text, body_json = decode_body(exc.read())
+        if allow_http_error:
+            return exc.code, body_json
+        raise CliError(f"HTTP {exc.code} for {url}: {body_text}") from exc
+    except urllib.error.URLError as exc:
+        raise CliError(f"Cannot reach runtime at {url}: {exc.reason}") from exc
+
+
+def unwrap_api_response(body: Any) -> Any:
+    if isinstance(body, dict) and {"success", "data"}.issubset(body.keys()):
+        success = bool(body.get("success"))
+        if not success:
+            raise CliError(str(body.get("message") or "Runtime API returned failure"))
+        return body.get("data")
+    return body
+
+
+def ensure_plan_array(plan_root: Any) -> list[dict[str, Any]]:
+    if not isinstance(plan_root, dict):
+        raise CliError("Invalid plan payload: root must be a JSON object")
+    plan = plan_root.get("plan")
+    if not isinstance(plan, list):
+        raise CliError("Invalid plan payload: missing 'plan' array")
+    for index, step in enumerate(plan):
+        if not isinstance(step, dict):
+            raise CliError(f"Invalid plan step at index {index}: must be object")
+        step_type = step.get("type")
+        if not isinstance(step_type, str) or not step_type.strip():
+            raise CliError(f"Invalid plan step at index {index}: missing type")
+        payload = step.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            raise CliError(f"Invalid plan step at index {index}: payload must be object")
+        depends_on = step.get("depends_on", [])
+        if not isinstance(depends_on, list) or not all(isinstance(v, int) for v in depends_on):
+            raise CliError(f"Invalid plan step at index {index}: depends_on must be integer array")
+    return plan
+
+
+def print_plan_compact(plan: list[dict[str, Any]]) -> None:
+    print("AsyncAIFlow Plan")
+    print()
+    for idx, step in enumerate(plan, start=1):
+        print(f"{idx} {step.get('type', 'unknown')}")
+
+
+def print_plan_tree(plan: list[dict[str, Any]]) -> None:
+    print("AsyncAIFlow Plan")
+    print()
+    for idx, step in enumerate(plan, start=1):
+        depends_on = step.get("depends_on") or []
+        head = f"{idx}. {step.get('type', 'unknown')}"
+        if depends_on:
+            human = ", ".join(str(x + 1) for x in depends_on)
+            head += f" <- depends on {human}"
+        print(head)
+
+        payload = step.get("payload") or {}
+        detail = None
+        for key in ("query", "issue", "focus", "module", "file"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                detail = f"   {key}: {value.strip()}"
+                break
+        if detail is None:
+            detail = f"   schemaVersion: {payload.get('schemaVersion', 'n/a')}"
+        print(detail)
+
+
+def launch_editor(target_path: pathlib.Path) -> None:
+    editor = os.environ.get("EDITOR", "vi").strip()
+    if not editor:
+        raise CliError("EDITOR is empty")
+
+    try:
+        command = shlex.split(editor)
+    except ValueError as exc:
+        raise CliError(f"Invalid EDITOR value '{editor}': {exc}") from exc
+
+    if not command:
+        raise CliError("EDITOR command is empty")
+
+    result = subprocess.run(command + [str(target_path)])
+    if result.returncode != 0:
+        raise CliError(f"Editor exited with code {result.returncode}")
+
+
+def last_plan_path(project_root: pathlib.Path) -> pathlib.Path:
+    return project_root / CONFIG_DIR_NAME / LAST_PLAN_FILE_NAME
+
+
+def last_run_path(project_root: pathlib.Path) -> pathlib.Path:
+    return project_root / CONFIG_DIR_NAME / LAST_RUN_FILE_NAME
+
+
+def cmd_init(_args: argparse.Namespace) -> int:
+    project_root = pathlib.Path.cwd()
+    aiflow_dir = project_root / CONFIG_DIR_NAME
+    config_file = config_path(project_root)
+    aiflow_dir.mkdir(parents=True, exist_ok=True)
+
+    config = dict(DEFAULT_CONFIG)
+    if config_file.exists():
+        existing = read_json_file(config_file)
+        if isinstance(existing, dict):
+            config.update({k: v for k, v in existing.items() if k in DEFAULT_CONFIG})
+
+    write_json_file(config_file, config)
+    print(f"Initialized AsyncAIFlow config: {config_file}")
+    return 0
+
+
+def request_plan(
+    runtime_url: str,
+    issue: str,
+    repo_context: str | None = None,
+    file_path: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"issue": issue}
+    if repo_context:
+        payload["repo_context"] = repo_context
+    if file_path:
+        payload["file"] = file_path
+
+    _, response_body = http_json("POST", f"{runtime_url}/planner/plan", payload)
+    response_data = unwrap_api_response(response_body)
+    plan = ensure_plan_array(response_data)
+    return {
+        "issue": issue,
+        "repo_context": repo_context or "",
+        "file": file_path or "",
+        "plan": plan,
+    }
+
+
+def cmd_issue(args: argparse.Namespace) -> int:
+    project_root = require_initialized_root()
+    config = load_config(project_root)
+    runtime_url = runtime_url_from_config(config)
+    plan_root = request_plan(runtime_url, args.issue, args.repo_context, args.file)
+    plan = ensure_plan_array(plan_root)
+
+    if args.json:
+        print(json.dumps(plan_root, ensure_ascii=False, indent=2))
+    else:
+        print_plan_compact(plan)
+
+    write_json_file(last_plan_path(project_root), plan_root)
+
+    saved_path: pathlib.Path | None = None
+    if args.save:
+        saved_path = pathlib.Path(args.save).expanduser().resolve()
+        write_json_file(saved_path, plan_root)
+        print(f"\nSaved plan: {saved_path}")
+
+    if args.edit:
+        edit_path = saved_path if saved_path is not None else last_plan_path(project_root)
+        launch_editor(edit_path)
+        print(f"Edited plan: {edit_path}")
+
+    return 0
+
+
+def load_plan_file(path_arg: str) -> tuple[pathlib.Path, dict[str, Any], list[dict[str, Any]]]:
+    plan_file = pathlib.Path(path_arg).expanduser().resolve()
+    root = read_json_file(plan_file)
+    plan = ensure_plan_array(root)
+    return plan_file, root, plan
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    _, _, plan = load_plan_file(args.plan_file)
+    print_plan_tree(plan)
+    return 0
+
+
+def submit_plan_to_runtime(
+    project_root: pathlib.Path,
+    runtime_url: str,
+    plan_file: pathlib.Path,
+    plan: list[dict[str, Any]],
+    workflow_name: str,
+    workflow_description: str,
+    *,
+    show_submission_progress: bool,
+) -> int:
+    _, workflow_body = http_json(
+        "POST",
+        f"{runtime_url}/workflow/create",
+        {
+            "name": workflow_name,
+            "description": workflow_description,
+        },
+    )
+    workflow_data = unwrap_api_response(workflow_body)
+    if not isinstance(workflow_data, dict) or "id" not in workflow_data:
+        raise CliError("Runtime returned invalid workflow response")
+
+    workflow_id = int(workflow_data["id"])
+    if show_submission_progress:
+        print("Running workflow")
+        print(f"workflow_id: {workflow_id}")
+        print()
+
+    action_ids: list[int] = []
+    step_runs: list[dict[str, Any]] = []
+
+    for idx, step in enumerate(plan):
+        step_type = str(step.get("type", "")).strip()
+        payload = step.get("payload") or {}
+        depends_on = step.get("depends_on") or []
+
+        upstream_action_ids: list[int] = []
+        for dep_index in depends_on:
+            if dep_index < 0 or dep_index >= len(action_ids):
+                raise CliError(
+                    f"Plan dependency index out of range at step {idx + 1}: {dep_index}"
+                )
+            upstream_action_ids.append(action_ids[dep_index])
+
+        action_payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        action_request = {
+            "workflowId": workflow_id,
+            "type": step_type,
+            "payload": action_payload_json,
+            "upstreamActionIds": upstream_action_ids,
+        }
+
+        _, action_body = http_json("POST", f"{runtime_url}/action/create", action_request)
+        action_data = unwrap_api_response(action_body)
+        if not isinstance(action_data, dict) or "id" not in action_data:
+            raise CliError(f"Runtime returned invalid action response for step {idx + 1}")
+
+        action_id = int(action_data["id"])
+        action_ids.append(action_id)
+
+        if show_submission_progress:
+            icon = "→" if idx == len(plan) - 1 else "✓"
+            print(f"{icon} {step_type}")
+
+        step_runs.append(
+            {
+                "index": idx,
+                "type": step_type,
+                "action_id": action_id,
+                "upstream_action_ids": upstream_action_ids,
+            }
+        )
+
+    run_record = {
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "runtime_url": runtime_url,
+        "workflow_id": workflow_id,
+        "workflow_name": workflow_name,
+        "plan_file": str(plan_file),
+        "steps": step_runs,
+    }
+    write_json_file(last_run_path(project_root), run_record)
+
+    if show_submission_progress:
+        print()
+        print(f"Saved run metadata: {last_run_path(project_root)}")
+
+    return workflow_id
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    project_root = require_initialized_root()
+    config = load_config(project_root)
+    runtime_url = runtime_url_from_config(config)
+
+    plan_file, plan_root, plan = load_plan_file(args.plan_file)
+
+    plan_issue = str(plan_root.get("issue") or "").strip()
+
+    workflow_name = args.name or f"aiflow-run-{current_timestamp()}"
+    workflow_description = args.description or plan_issue or f"Created by aiflow run from {plan_file.name}"
+
+    _ = submit_plan_to_runtime(
+        project_root,
+        runtime_url,
+        plan_file,
+        plan,
+        workflow_name,
+        workflow_description,
+        show_submission_progress=True,
+    )
+    return 0
+
+
+def fetch_workflow_execution(runtime_url: str, workflow_id: int) -> dict[str, Any]:
+    endpoint = f"{runtime_url}/workflow/{urllib.parse.quote(str(workflow_id), safe='')}"
+    _, body = http_json("GET", endpoint)
+    data = unwrap_api_response(body)
+    if not isinstance(data, dict):
+        raise CliError(f"Runtime returned invalid workflow payload for workflow {workflow_id}")
+    return data
+
+
+def fetch_workflow_actions(runtime_url: str, workflow_id: int) -> list[dict[str, Any]]:
+    endpoint = f"{runtime_url}/workflow/{urllib.parse.quote(str(workflow_id), safe='')}/actions"
+    _, body = http_json("GET", endpoint)
+    data = unwrap_api_response(body)
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise CliError(f"Runtime returned invalid action list for workflow {workflow_id}")
+    return data
+
+
+def fetch_recent_workflows(runtime_url: str, limit: int = 1) -> list[dict[str, Any]]:
+    endpoint = f"{runtime_url}/workflows?limit={max(1, limit)}"
+    _, body = http_json("GET", endpoint)
+    data = unwrap_api_response(body)
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise CliError("Runtime returned invalid recent workflow payload")
+    return data
+
+
+def fetch_action_execution(runtime_url: str, action_id: int) -> dict[str, Any]:
+    endpoint = f"{runtime_url}/action/{urllib.parse.quote(str(action_id), safe='')}"
+    _, body = http_json("GET", endpoint)
+    data = unwrap_api_response(body)
+    if not isinstance(data, dict):
+        raise CliError(f"Runtime returned invalid action payload for action {action_id}")
+    return data
+
+
+def action_status_icon(status: str) -> str:
+    normalized = status.strip().upper()
+    if normalized == "COMPLETED":
+        return "✓"
+    if normalized == "RUNNING":
+        return "→"
+    if normalized == "FAILED":
+        return "✗"
+    return "·"
+
+
+def action_status_marker_ascii(status: str) -> str:
+    normalized = status.strip().upper()
+    if normalized == "COMPLETED":
+        return "[OK]"
+    if normalized == "RUNNING":
+        return "[..]"
+    if normalized == "FAILED":
+        return "[X]"
+    return "[ ]"
+
+
+def parse_numeric_id(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def load_last_run_record(project_root: pathlib.Path) -> dict[str, Any] | None:
+    run_file = last_run_path(project_root)
+    if not run_file.exists():
+        return None
+
+    record = read_json_file(run_file)
+    return record if isinstance(record, dict) else None
+
+
+def resolve_workflow_id(
+    project_root: pathlib.Path,
+    runtime_url: str,
+    explicit_workflow_id: int | None,
+) -> int | None:
+    if explicit_workflow_id is not None:
+        return explicit_workflow_id
+
+    run_record = load_last_run_record(project_root)
+    if isinstance(run_record, dict):
+        raw_workflow_id = run_record.get("workflow_id")
+        parsed = parse_numeric_id(raw_workflow_id)
+        if parsed is not None:
+            return parsed
+
+    recent_workflows = fetch_recent_workflows(runtime_url, limit=1)
+    if recent_workflows:
+        parsed = parse_numeric_id(recent_workflows[0].get("workflowId"))
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def workflow_progress(actions: list[dict[str, Any]]) -> tuple[int, int]:
+    total = len(actions)
+    completed = sum(1 for action in actions if str(action.get("status") or "").upper() == "COMPLETED")
+    return completed, total
+
+
+def print_workflow_action_lines(
+    actions: list[dict[str, Any]],
+    *,
+    marker,
+) -> None:
+    for action in actions:
+        step_type = str(action.get("type") or "unknown")
+        status = str(action.get("status") or "PENDING")
+        print(f"{marker(status)} {step_type}")
+
+
+def stream_workflow_progress(
+    runtime_url: str,
+    workflow_id: int,
+    *,
+    poll_interval_seconds: float = 2.0,
+    timeout_seconds: int = 300,
+) -> None:
+    start = time.monotonic()
+    last_signature: tuple[Any, ...] | None = None
+
+    while True:
+        workflow_execution = fetch_workflow_execution(runtime_url, workflow_id)
+        workflow_actions = fetch_workflow_actions(runtime_url, workflow_id)
+        status = str(workflow_execution.get("status") or "RUNNING").upper()
+        signature = (
+            status,
+            tuple(
+                (
+                    parse_numeric_id(action.get("actionId")),
+                    str(action.get("status") or "PENDING"),
+                )
+                for action in workflow_actions
+            ),
+        )
+
+        if signature != last_signature:
+            print(f"Status: {status}")
+            if not workflow_actions:
+                print("(no actions)")
+            else:
+                completed, total = workflow_progress(workflow_actions)
+                print(f"Progress {completed}/{total}")
+                print()
+                print_workflow_action_lines(workflow_actions, marker=action_status_marker_ascii)
+            print()
+            last_signature = signature
+
+        if status in ("COMPLETED", "FAILED"):
+            print(f"Workflow {workflow_id} {status.lower()}")
+            return
+
+        if time.monotonic() - start >= timeout_seconds:
+            print(f"Workflow {workflow_id} progress stream timed out after {timeout_seconds} seconds")
+            return
+
+        time.sleep(max(0.5, poll_interval_seconds))
+
+
+def prompt_input(prompt: str) -> str | None:
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    while True:
+        raw = prompt_input(prompt)
+        if raw is None:
+            return default
+        normalized = raw.strip().lower()
+        if not normalized:
+            return default
+        if normalized in ("y", "yes"):
+            return True
+        if normalized in ("n", "no"):
+            return False
+        print("Please enter y or n.")
+
+
+def prompt_int(prompt: str, *, default: int | None = None) -> int | None:
+    raw = prompt_input(prompt)
+    if raw is None:
+        return default
+    normalized = raw.strip()
+    if not normalized:
+        return default
+    if not normalized.isdigit():
+        raise CliError(f"Invalid numeric value: {normalized}")
+    return int(normalized)
+
+
+def pretty_value(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def mask_secret(value: str) -> str:
+    if not value:
+        return "(empty)"
+    if len(value) <= 6:
+        return "*" * len(value)
+    return value[:3] + "..." + value[-3:]
+
+
+def interactive_new_issue(project_root: pathlib.Path, runtime_url: str) -> None:
+    print("\nNew Issue")
+    print("-" * 40)
+
+    issue_raw = prompt_input("Describe your issue: ")
+    if issue_raw is None:
+        return
+    issue = issue_raw.strip()
+    if not issue:
+        print("Issue is required.")
+        return
+
+    repo_context = (prompt_input("Repo context (optional): ") or "").strip()
+    file_path = (prompt_input("File path (optional): ") or "").strip()
+
+    plan_root = request_plan(runtime_url, issue, repo_context or None, file_path or None)
+    plan = ensure_plan_array(plan_root)
+    write_json_file(last_plan_path(project_root), plan_root)
+
+    print()
+    print("Plan")
+    print("-" * 40)
+    print_plan_tree(plan)
+    print()
+
+    if not prompt_yes_no("Run this workflow now? [y/n]: ", default=True):
+        return
+
+    workflow_name = f"aiflow-interactive-{current_timestamp()}"
+    workflow_id = submit_plan_to_runtime(
+        project_root,
+        runtime_url,
+        last_plan_path(project_root),
+        plan,
+        workflow_name,
+        issue,
+        show_submission_progress=False,
+    )
+
+    print()
+    print(f"Workflow {workflow_id} started")
+    print("-" * 40)
+    stream_workflow_progress(runtime_url, workflow_id)
+
+
+def interactive_recent_workflows(runtime_url: str) -> None:
+    print("\nRecent Workflows")
+    print("-" * 40)
+
+    limit = prompt_int("Limit (default 10): ", default=10)
+    if limit is None:
+        limit = 10
+    workflows = fetch_recent_workflows(runtime_url, limit=limit)
+    if not workflows:
+        print("(no workflows)")
+        return
+
+    print(f"{'ID':<20} {'STATUS':<10} ISSUE")
+    print("-" * 72)
+    for workflow in workflows:
+        workflow_id = str(workflow.get("workflowId") or "?")
+        status = str(workflow.get("status") or "UNKNOWN")
+        issue = str(workflow.get("issue") or "").strip()
+        if len(issue) > 38:
+            issue = issue[:35] + "..."
+        print(f"{workflow_id:<20} {status:<10} {issue}")
+
+
+def interactive_workflow_status(project_root: pathlib.Path, runtime_url: str) -> None:
+    print("\nWorkflow Status")
+    print("-" * 40)
+    raw = prompt_input("Workflow ID (blank = latest): ")
+    explicit_id = parse_numeric_id(raw.strip()) if raw is not None and raw.strip() else None
+    if raw is not None and raw.strip() and explicit_id is None:
+        raise CliError(f"Invalid workflow id: {raw.strip()}")
+
+    workflow_id = resolve_workflow_id(project_root, runtime_url, explicit_id)
+    if workflow_id is None:
+        raise CliError("No workflow id provided and runtime has no recent workflows")
+
+    workflow_execution = fetch_workflow_execution(runtime_url, workflow_id)
+    workflow_actions = fetch_workflow_actions(runtime_url, workflow_id)
+
+    print(f"Workflow {workflow_id}")
+    print(f"Status: {str(workflow_execution.get('status') or 'UNKNOWN').upper()}")
+    print()
+    if not workflow_actions:
+        print("(no actions)")
+        return
+
+    completed, total = workflow_progress(workflow_actions)
+    print(f"Progress {completed}/{total}")
+    print()
+    print_workflow_action_lines(workflow_actions, marker=action_status_marker_ascii)
+
+
+def interactive_action_detail(runtime_url: str) -> None:
+    print("\nAction Detail")
+    print("-" * 40)
+    action_id = prompt_int("Action ID: ")
+    if action_id is None:
+        print("Action ID is required.")
+        return
+
+    detail = fetch_action_execution(runtime_url, action_id)
+
+    print(f"Action ID : {detail.get('actionId')}")
+    print(f"Workflow  : {detail.get('workflowId')}")
+    print(f"Type      : {detail.get('type')}")
+    print(f"Status    : {detail.get('status')}")
+    print(f"Worker    : {detail.get('workerId')}")
+    print(f"Started   : {detail.get('startedAt')}")
+    print(f"Finished  : {detail.get('finishedAt')}")
+    print(f"Error     : {detail.get('error')}")
+
+    payload = detail.get("payload")
+    if payload is not None:
+        print("\nPayload")
+        print("-" * 40)
+        print(pretty_value(payload))
+
+    result = detail.get("result")
+    if result is not None:
+        print("\nResult")
+        print("-" * 40)
+        print(pretty_value(result))
+
+    logs = detail.get("logs")
+    if isinstance(logs, list) and logs:
+        print("\nLogs")
+        print("-" * 40)
+        for index, log_entry in enumerate(logs, start=1):
+            if not isinstance(log_entry, dict):
+                continue
+            created_at = log_entry.get("createdAt")
+            status = log_entry.get("status")
+            worker_id = log_entry.get("workerId")
+            print(f"{index}. {created_at} {status} worker={worker_id}")
+
+
+def interactive_run_plan_file(project_root: pathlib.Path, runtime_url: str) -> None:
+    print("\nRun Plan File")
+    print("-" * 40)
+
+    default_plan = last_plan_path(project_root)
+    if default_plan.exists():
+        prompt = f"Plan file path (default {default_plan}): "
+    else:
+        prompt = "Plan file path: "
+
+    raw_plan_path = prompt_input(prompt)
+    if raw_plan_path is None:
+        return
+
+    plan_path = raw_plan_path.strip()
+    if not plan_path:
+        if default_plan.exists():
+            plan_path = str(default_plan)
+        else:
+            print("Plan file path is required.")
+            return
+
+    plan_file, plan_root, plan = load_plan_file(plan_path)
+    print()
+    print_plan_tree(plan)
+    print()
+    if not prompt_yes_no("Run this workflow now? [y/n]: ", default=True):
+        return
+
+    plan_issue = str(plan_root.get("issue") or "").strip()
+    workflow_name = f"aiflow-interactive-{current_timestamp()}"
+    workflow_description = plan_issue or f"Created by aiflow interactive from {plan_file.name}"
+    workflow_id = submit_plan_to_runtime(
+        project_root,
+        runtime_url,
+        plan_file,
+        plan,
+        workflow_name,
+        workflow_description,
+        show_submission_progress=False,
+    )
+
+    print()
+    print(f"Workflow {workflow_id} started")
+    print("-" * 40)
+    stream_workflow_progress(runtime_url, workflow_id)
+
+
+def interactive_settings(project_root: pathlib.Path) -> None:
+    while True:
+        config = load_config(project_root)
+        print("\nSettings")
+        print("-" * 40)
+        print(f"runtime_url      : {config.get('runtime_url', '')}")
+        print(f"openai_api_key   : {mask_secret(str(config.get('openai_api_key', '')))}")
+        print(f"deepseek_api_key : {mask_secret(str(config.get('deepseek_api_key', '')))}")
+        print()
+        print("[1] Edit runtime_url")
+        print("[2] Edit openai_api_key")
+        print("[3] Edit deepseek_api_key")
+        print("[0] Back")
+
+        choice = prompt_input("Select > ")
+        if choice is None:
+            return
+        normalized = choice.strip()
+        if normalized == "0":
+            return
+
+        if normalized == "1":
+            value = prompt_input("runtime_url: ")
+            if value is None:
+                return
+            cleaned = value.strip()
+            if not cleaned:
+                print("runtime_url cannot be empty")
+                continue
+            config["runtime_url"] = cleaned
+        elif normalized == "2":
+            value = prompt_input("openai_api_key (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["openai_api_key"] = value.strip()
+        elif normalized == "3":
+            value = prompt_input("deepseek_api_key (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["deepseek_api_key"] = value.strip()
+        else:
+            print("Unknown menu option")
+            continue
+
+        write_json_file(config_path(project_root), config)
+        print("Settings saved")
+
+
+def cmd_interactive(_args: argparse.Namespace) -> int:
+    project_root = require_initialized_root()
+
+    while True:
+        config = load_config(project_root)
+        runtime_url = runtime_url_from_config(config)
+
+        print()
+        print("+---------------------------------------------+")
+        print("|                  AsyncAIFlow                |")
+        print("|          AI Workflow Terminal Console       |")
+        print("+---------------------------------------------+")
+        print(f"Workspace: {project_root.name}")
+        print(f"Server:    {runtime_url}")
+        print()
+        print("[1] New Issue")
+        print("[2] Recent Workflows")
+        print("[3] Workflow Status")
+        print("[4] Action Detail")
+        print("[5] Run Plan File")
+        print("[6] Settings")
+        print("[0] Exit")
+
+        choice = prompt_input("Select > ")
+        if choice is None:
+            print()
+            return 0
+
+        normalized = choice.strip()
+        try:
+            if normalized == "1":
+                interactive_new_issue(project_root, runtime_url)
+            elif normalized == "2":
+                interactive_recent_workflows(runtime_url)
+            elif normalized == "3":
+                interactive_workflow_status(project_root, runtime_url)
+            elif normalized == "4":
+                interactive_action_detail(runtime_url)
+            elif normalized == "5":
+                interactive_run_plan_file(project_root, runtime_url)
+            elif normalized == "6":
+                interactive_settings(project_root)
+            elif normalized == "0":
+                print("Bye")
+                return 0
+            else:
+                print("Unknown menu option")
+        except CliError as exc:
+            print(f"aiflow: {exc}")
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    project_root = require_initialized_root()
+    config = load_config(project_root)
+    runtime_url = runtime_url_from_config(config)
+
+    workflow_id = resolve_workflow_id(project_root, runtime_url, args.workflow_id)
+    if workflow_id is None:
+        raise CliError("No workflow id provided, no .aiflow/last-run.json found, and runtime returned no recent workflows.")
+
+    workflow_execution = fetch_workflow_execution(runtime_url, workflow_id)
+    workflow_actions = fetch_workflow_actions(runtime_url, workflow_id)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "workflow": workflow_execution,
+                    "actions": workflow_actions,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"Workflow {workflow_id}")
+    print(f"Status: {str(workflow_execution.get('status') or 'UNKNOWN').upper()}")
+    print()
+    if not workflow_actions:
+        print("(no actions)")
+        return 0
+
+    completed_count, total_count = workflow_progress(workflow_actions)
+    print(f"Progress {completed_count}/{total_count}")
+    print()
+
+    print_workflow_action_lines(workflow_actions, marker=action_status_icon)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="aiflow",
+        description="AsyncAIFlow developer CLI",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init", help="Initialize .aiflow config in current project")
+    init_parser.set_defaults(handler=cmd_init)
+
+    issue_parser = subparsers.add_parser("issue", help="Create a plan from a natural language issue")
+    issue_parser.add_argument("issue", help="Natural language issue statement")
+    issue_parser.add_argument("--repo-context", dest="repo_context", help="Optional repository context")
+    issue_parser.add_argument("--file", help="Optional file path context")
+    issue_parser.add_argument("--save", help="Save planner output to a plan file")
+    issue_parser.add_argument("--edit", action="store_true", help="Open generated plan in $EDITOR")
+    issue_parser.add_argument("--json", action="store_true", help="Print raw plan JSON")
+    issue_parser.set_defaults(handler=cmd_issue)
+
+    plan_parser = subparsers.add_parser("plan", help="Display a readable plan tree from a plan file")
+    plan_parser.add_argument("plan_file", help="Path to plan JSON file")
+    plan_parser.set_defaults(handler=cmd_plan)
+
+    run_parser = subparsers.add_parser("run", help="Submit a plan file to runtime as workflow/actions")
+    run_parser.add_argument("plan_file", help="Path to plan JSON file")
+    run_parser.add_argument("--name", help="Workflow name override")
+    run_parser.add_argument("--description", help="Workflow description override")
+    run_parser.set_defaults(handler=cmd_run)
+
+    status_parser = subparsers.add_parser("status", help="Query workflow status from runtime")
+    status_parser.add_argument("--workflow-id", type=int, help="Workflow id to query")
+    status_parser.add_argument("--json", action="store_true", help="Print status payload as JSON")
+    status_parser.set_defaults(handler=cmd_status)
+
+    interactive_parser = subparsers.add_parser("interactive", help="Start interactive ASCII workflow console")
+    interactive_parser.set_defaults(handler=cmd_interactive)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return int(args.handler(args))
+    except CliError as exc:
+        print(f"aiflow: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("aiflow: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -5,3 +5,7 @@
 /.DS_Store
 /*.log
 /.env
+/.aiflow/
+/node_modules/
+__pycache__/
+*.pyc
