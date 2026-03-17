@@ -15,6 +15,7 @@ import com.asyncaiflow.web.dto.CreateWorkflowRequest;
 import com.asyncaiflow.web.dto.WorkflowActionSummaryResponse;
 import com.asyncaiflow.web.dto.WorkflowExecutionResponse;
 import com.asyncaiflow.web.dto.WorkflowResponse;
+import com.asyncaiflow.web.dto.WorkflowSummaryResponse;
 
 import jakarta.validation.Valid;
 
@@ -41,5 +42,10 @@ public class WorkflowController {
     @GetMapping("/{workflowId}/actions")
     public ApiResponse<List<WorkflowActionSummaryResponse>> getWorkflowActions(@PathVariable Long workflowId) {
         return ApiResponse.ok("workflow action execution state", workflowService.getWorkflowActions(workflowId));
+    }
+
+    @GetMapping("/{workflowId}/summary")
+    public ApiResponse<WorkflowSummaryResponse> getWorkflowSummary(@PathVariable Long workflowId) {
+        return ApiResponse.ok("workflow summary", workflowService.getWorkflowSummary(workflowId));
     }
 }

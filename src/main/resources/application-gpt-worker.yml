@@ -14,6 +14,8 @@ asyncaiflow:
       - design_solution
       - review_code
       - generate_explanation
+      - generate_patch
+      - review_patch
     poll-interval-millis: 2000
     heartbeat-interval-millis: 10000
     max-actions: 0

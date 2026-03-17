@@ -1,7 +1,11 @@
 package com.asyncaiflow.worker.gpt;
 
 import java.io.IOException;
+import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,10 +24,15 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GptWorkerActionHandler.class);
 
+        private static final Pattern FENCED_CODE_BLOCK_PATTERN =
+            Pattern.compile("```(?:diff|patch)?\\s*(.*?)```", Pattern.DOTALL);
+
     private static final Set<String> SUPPORTED_ACTION_TYPES = Set.of(
             "design_solution",
             "review_code",
-            "generate_explanation"
+            "generate_explanation",
+            "generate_patch",
+            "review_patch"
     );
 
     private final ObjectMapper objectMapper;
@@ -47,7 +56,7 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
         if (!SUPPORTED_ACTION_TYPES.contains(assignment.type())) {
             return WorkerExecutionResult.failed(
                     "unsupported action type",
-                    "GPT worker supports only design_solution, review_code and generate_explanation"
+                    "GPT worker supports design_solution, review_code, generate_explanation, generate_patch and review_patch"
             );
         }
 
@@ -75,7 +84,7 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
         Prompt prompt = buildPrompt(assignment.type(), payload);
         try {
             String completion = llmClient.complete(prompt.systemPrompt(), prompt.userPrompt());
-            String resultJson = buildResultJson(assignment, completion);
+            String resultJson = buildResultJson(assignment, payload, completion);
 
                 if (validationMode != SchemaValidationMode.OFF) {
                 ActionSchemaValidator.ValidationReport resultValidation =
@@ -132,9 +141,12 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
 
     private Prompt buildPrompt(String actionType, JsonNode payload) {
         return switch (actionType) {
+            case "design_solution" -> buildDesignSolutionPrompt(payload);
             case "review_code" -> buildReviewCodePrompt(payload);
             case "generate_explanation" -> buildGenerateExplanationPrompt(payload);
-            default -> buildDesignSolutionPrompt(payload);
+            case "generate_patch" -> buildGeneratePatchPrompt(payload);
+            case "review_patch" -> buildReviewPatchPrompt(payload);
+            default -> throw new IllegalArgumentException("unsupported action type: " + actionType);
         };
     }
 
@@ -146,11 +158,13 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
                 "No issue provided"
         );
 
-        String context = payload.path("context").asText("");
-        String constraints = payload.path("constraints").asText("");
+        String context = renderPayloadValue(payload.get("context"));
+        String constraints = renderStringList(payload.get("constraints"));
 
         String systemPrompt = "You are a pragmatic senior software architect. " +
-                "Return implementation-ready solution guidance with trade-offs and risk notes.";
+            "Always respond in Simplified Chinese and format output in Markdown. " +
+            "Use sections exactly: 结论, 发现, 代码位置, 建议修复, 风险. " +
+            "Ground recommendations in provided evidence.";
 
         String userPrompt = """
             Action: design_solution
@@ -163,7 +177,7 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
             Constraints:
             %s
 
-            Return sections: Proposed Design, Step Plan, Risks.
+            Return concise, implementation-ready guidance.
             """.formatted(issue, context, constraints);
 
         return new Prompt(systemPrompt, userPrompt);
@@ -176,12 +190,15 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
                 "correctness, reliability and maintainability"
         );
 
-        String diff = payload.path("diff").asText("");
-        String code = payload.path("code").asText("");
-        String context = payload.path("context").asText("");
+        String diff = renderPayloadValue(payload.get("diff"));
+        String code = renderPayloadValue(payload.get("code"));
+        String context = renderPayloadValue(payload.get("context"));
+        String knownIssues = renderStringList(payload.get("knownIssues"));
 
-        String systemPrompt = "You are a strict senior reviewer. " +
-                "Find defects first, then provide concrete and minimal fixes.";
+        String systemPrompt = "You are a strict senior code reviewer. " +
+            "Always respond in Simplified Chinese and format output in Markdown. " +
+            "Use sections exactly: 结论, 发现, 代码位置, 建议修复, 风险. " +
+            "Prioritize concrete defects over generic advice.";
 
         String userPrompt = """
             Action: review_code
@@ -197,8 +214,11 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
             Code:
             %s
 
-            Return sections: Findings, Suggested Fixes, Residual Risks.
-            """.formatted(reviewFocus, context, diff, code);
+            Known issues:
+            %s
+
+            If code or diff is missing, state evidence limits clearly before conclusions.
+            """.formatted(reviewFocus, context, diff, code, knownIssues);
 
         return new Prompt(systemPrompt, userPrompt);
     }
@@ -220,7 +240,9 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
         String gatheredContext = renderPayloadValue(payload.get("gathered_context"));
 
         String systemPrompt = "You are a pragmatic senior engineer explaining how a codebase works to another engineer. " +
-                "Stay concrete, separate confirmed facts from inference, and explicitly call out missing context.";
+            "Always respond in Simplified Chinese and format output in Markdown. " +
+            "Use sections exactly: 结论, 发现, 代码位置, 建议修复, 风险. " +
+            "Separate confirmed facts from inference and call out missing context explicitly.";
 
         String userPrompt = """
             Action: generate_explanation
@@ -239,7 +261,7 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
             Gathered context:
             %s
 
-            Return sections: Summary, Interaction Flow, Key Components, Open Questions.
+            Explain concrete flow and components with verifiable evidence.
             """.formatted(
             issue,
             promptValue(repoContext),
@@ -250,11 +272,125 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
         return new Prompt(systemPrompt, userPrompt);
     }
 
-    private String buildResultJson(ActionAssignment assignment, String completion) throws IOException {
+    private Prompt buildGeneratePatchPrompt(JsonNode payload) {
+    String issue = firstNonBlank(
+        payload.path("issue").asText(null),
+        payload.path("problem").asText(null),
+        payload.path("title").asText(null),
+        "No issue provided"
+    );
+    String file = firstNonBlank(
+        payload.path("file").asText(null),
+        payload.path("path").asText(null),
+        "n/a"
+    );
+    String context = renderPayloadValue(payload.get("context"));
+    String code = renderPayloadValue(payload.get("code"));
+    String designSummary = firstNonBlank(
+        payload.path("designSummary").asText(null),
+        payload.path("design").asText(null),
+        payload.path("solution").asText(null),
+        "n/a"
+    );
+    String constraints = renderStringList(payload.get("constraints"));
+
+    String systemPrompt = "You are a pragmatic senior engineer that prepares minimal, safe code patches. " +
+        "Always respond in Simplified Chinese and format output in Markdown. " +
+        "Use sections exactly: 结论, 修改文件, 统一补丁, 风险. " +
+        "In section 统一补丁, output exactly one fenced diff block using unified diff format that can be applied by git apply.";
+
+    String userPrompt = """
+        Action: generate_patch
+        Issue:
+        %s
+
+        File:
+        %s
+
+        Design summary:
+        %s
+
+        Context:
+        %s
+
+        Code:
+        %s
+
+        Constraints:
+        %s
+
+        Return a minimal unified diff only for the necessary fix, plus concise review notes in the required sections.
+        """.formatted(issue, promptValue(file), promptValue(designSummary), promptValue(context), promptValue(code), constraints);
+
+    return new Prompt(systemPrompt, userPrompt);
+    }
+
+    private Prompt buildReviewPatchPrompt(JsonNode payload) {
+    String issue = firstNonBlank(
+        payload.path("issue").asText(null),
+        payload.path("problem").asText(null),
+        payload.path("title").asText(null),
+        "No issue provided"
+    );
+    String file = firstNonBlank(
+        payload.path("file").asText(null),
+        payload.path("path").asText(null),
+        "n/a"
+    );
+    String context = renderPayloadValue(payload.get("context"));
+    String code = renderPayloadValue(payload.get("code"));
+    String designSummary = firstNonBlank(
+        payload.path("designSummary").asText(null),
+        payload.path("design").asText(null),
+        payload.path("solution").asText(null),
+        "n/a"
+    );
+    String patch = renderPayloadValue(payload.get("patch"));
+    String knownRisks = renderStringList(payload.get("knownRisks"));
+
+    String systemPrompt = "You are a strict senior reviewer validating unified diffs before they are applied. " +
+        "Always respond in Simplified Chinese and format output in Markdown. " +
+        "Use sections exactly: 结论, 发现, 是否可应用, 修订补丁, 风险. " +
+        "In section 修订补丁, output exactly one fenced diff block with the final patch to apply. " +
+        "If the patch is unsafe, explain blocking issues clearly.";
+
+    String userPrompt = """
+        Action: review_patch
+        Issue:
+        %s
+
+        File:
+        %s
+
+        Design summary:
+        %s
+
+        Context:
+        %s
+
+        Current code:
+        %s
+
+        Candidate patch:
+        %s
+
+        Known risks:
+        %s
+
+        Verify correctness and safety. Keep the patch minimal, and return the final unified diff in the required section.
+        """.formatted(issue, promptValue(file), promptValue(designSummary), promptValue(context), promptValue(code), promptValue(patch), knownRisks);
+
+    return new Prompt(systemPrompt, userPrompt);
+    }
+
+    private String buildResultJson(ActionAssignment assignment, JsonNode payload, String completion) throws IOException {
         return switch (assignment.type()) {
+        case "design_solution" -> buildDesignSolutionResultJson(completion);
             case "review_code" -> buildReviewCodeResultJson(completion);
             case "generate_explanation" -> buildGenerateExplanationResultJson(completion);
-            default -> buildDesignSolutionResultJson(completion);
+        case "generate_patch" -> buildGeneratePatchResultJson(payload, completion);
+        case "review_patch" -> buildReviewPatchResultJson(payload, completion);
+        default -> throw new IllegalArgumentException("unsupported action type: " + assignment.type());
         };
     }
 
@@ -294,6 +430,62 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
         result.put("summary", summarize(completion, 220));
         result.put("content", completion);
         result.put("confidence", 0.71D);
+        return objectMapper.writeValueAsString(result);
+    }
+
+    private String buildGeneratePatchResultJson(JsonNode payload, String completion) throws IOException {
+        String patch = extractUnifiedDiff(completion);
+        if (patch.isBlank()) {
+            throw new IllegalArgumentException("generate_patch completion did not contain a unified diff block");
+        }
+
+        ObjectNode result = objectMapper.createObjectNode();
+        result.put("schemaVersion", "v1");
+        result.put("worker", "gpt-worker");
+        result.put("model", llmClient.modelName());
+        result.put("summary", summarize(completion, 220));
+        result.put("patch", patch);
+        result.put("content", completion);
+        result.put("confidence", 0.58D);
+
+        ArrayNode targetFiles = result.putArray("targetFiles");
+        for (String targetFile : extractTargetFiles(payload, patch)) {
+            targetFiles.add(targetFile);
+        }
+
+        return objectMapper.writeValueAsString(result);
+    }
+
+    private String buildReviewPatchResultJson(JsonNode payload, String completion) throws IOException {
+        String patch = extractUnifiedDiff(completion);
+        if (patch.isBlank()) {
+            patch = firstNonBlank(payload.path("patch").asText(null));
+        }
+        if (patch.isBlank()) {
+            throw new IllegalArgumentException("review_patch completion did not contain a unified diff block");
+        }
+
+        boolean approved = inferPatchApproved(completion);
+        if (!approved) {
+            throw new IllegalArgumentException("review_patch rejected the candidate patch");
+        }
+
+        ObjectNode result = objectMapper.createObjectNode();
+        result.put("schemaVersion", "v1");
+        result.put("worker", "gpt-worker");
+        result.put("model", llmClient.modelName());
+        result.put("summary", summarize(completion, 220));
+        result.put("approved", true);
+        result.put("patch", patch);
+        result.put("content", completion);
+        result.put("confidence", 0.63D);
+
+        ArrayNode findings = result.putArray("findings");
+        ObjectNode finding = findings.addObject();
+        finding.put("severity", "minor");
+        finding.put("title", "Patch review summary");
+        finding.put("detail", summarize(completion, 900));
+
         return objectMapper.writeValueAsString(result);
     }
 
@@ -346,6 +538,142 @@ public class GptWorkerActionHandler implements WorkerActionHandler {
 
     private String promptValue(String value) {
         return (value == null || value.isBlank()) ? "n/a" : value;
+    }
+
+    private String renderStringList(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return "n/a";
+        }
+
+        if (node.isTextual()) {
+            String value = node.asText("").trim();
+            return value.isBlank() ? "n/a" : value;
+        }
+
+        if (!node.isArray()) {
+            return renderPayloadValue(node);
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (JsonNode item : node) {
+            String value = item == null ? "" : item.asText("").trim();
+            if (value.isBlank()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append('\n');
+            }
+            builder.append("- ").append(value);
+        }
+
+        return builder.length() == 0 ? "n/a" : builder.toString();
+    }
+
+    private String extractUnifiedDiff(String content) {
+        if (content == null || content.isBlank()) {
+            return "";
+        }
+
+        Matcher matcher = FENCED_CODE_BLOCK_PATTERN.matcher(content);
+        while (matcher.find()) {
+            String block = matcher.group(1).trim();
+            if (looksLikeUnifiedDiff(block)) {
+                return block;
+            }
+        }
+
+        String normalized = content.trim();
+        int diffIndex = normalized.indexOf("diff --git ");
+        if (diffIndex >= 0) {
+            String candidate = normalized.substring(diffIndex).trim();
+            if (looksLikeUnifiedDiff(candidate)) {
+                return candidate;
+            }
+        }
+
+        int headerIndex = normalized.indexOf("--- ");
+        if (headerIndex >= 0) {
+            String candidate = normalized.substring(headerIndex).trim();
+            if (looksLikeUnifiedDiff(candidate)) {
+                return candidate;
+            }
+        }
+
+        return "";
+    }
+
+    private boolean looksLikeUnifiedDiff(String candidate) {
+        if (candidate == null || candidate.isBlank()) {
+            return false;
+        }
+
+        String normalized = candidate.trim();
+        return normalized.contains("\n+++ ")
+                && (normalized.contains("\n@@ ")
+                || normalized.startsWith("diff --git ")
+                || normalized.startsWith("--- "));
+    }
+
+    private Set<String> extractTargetFiles(JsonNode payload, String patch) {
+        LinkedHashSet<String> targetFiles = new LinkedHashSet<>();
+        if (patch != null && !patch.isBlank()) {
+            for (String line : patch.split("\\R")) {
+                if (!line.startsWith("+++ ")) {
+                    continue;
+                }
+                String value = normalizeDiffPath(line.substring(4).trim());
+                if (!value.isBlank()) {
+                    targetFiles.add(value);
+                }
+            }
+        }
+
+        String payloadFile = firstNonBlank(
+                payload.path("file").asText(null),
+                payload.path("path").asText(null));
+        if (!payloadFile.isBlank()) {
+            targetFiles.add(payloadFile);
+        }
+        return targetFiles;
+    }
+
+    private String normalizeDiffPath(String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) {
+            return "";
+        }
+
+        String normalized = rawPath.trim();
+        if ("/dev/null".equals(normalized)) {
+            return "";
+        }
+        if (normalized.startsWith("a/") || normalized.startsWith("b/")) {
+            normalized = normalized.substring(2);
+        }
+        return normalized;
+    }
+
+    private boolean inferPatchApproved(String completion) {
+        if (completion == null || completion.isBlank()) {
+            return false;
+        }
+
+        String normalized = completion.toLowerCase(Locale.ROOT);
+        return !containsAny(normalized,
+                "不可应用",
+                "不要应用",
+                "拒绝",
+                "blocking",
+                "reject",
+                "rejected");
+    }
+
+    private boolean containsAny(String value, String... candidates) {
+        for (String candidate : candidates) {
+            if (value.contains(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private record PayloadParseResult(boolean parseable, JsonNode payloadNode, String errorMessage) {

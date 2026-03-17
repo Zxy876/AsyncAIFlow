@@ -115,7 +115,63 @@ Example:
 }
 ```
 
-### 4. GET /action/{actionId}
+### 4. GET /workflow/{workflowId}/summary
+
+Returns an aggregated workflow summary with ordered plan steps, per-action compact results, `contextQuality` retrieval/noise signals, and extracted findings/warnings/suggestions.
+
+Example:
+
+```json
+{
+  "success": true,
+  "message": "workflow summary",
+  "data": {
+    "workflowId": 12345,
+    "status": "COMPLETED",
+    "issue": "Explain runtime_ir module",
+    "createdAt": "2026-03-16T07:30:44",
+    "finishedAt": "2026-03-16T07:31:10",
+    "durationSeconds": 26,
+    "plan": [
+      "search_semantic",
+      "build_context_pack",
+      "generate_explanation"
+    ],
+    "actions": [
+      {
+        "actionId": 2001,
+        "actionType": "search_semantic",
+        "status": "COMPLETED",
+        "workerId": "repository-worker-1",
+        "durationSeconds": 1,
+        "shortResult": "matches: 5",
+        "matchCount": 5,
+        "sourceCount": null,
+        "retrievalCount": null,
+        "noisyRetrieval": true
+      }
+    ],
+    "contextQuality": {
+      "retrievalCount": 5,
+      "sourceCount": 3,
+      "noisyActionCount": 1,
+      "noiseDetected": true,
+      "noiseSummary": "dependency directories detected (venv/site-packages/node_modules)"
+    },
+    "keyFindings": [
+      "runtime_ir is an intermediate representation layer"
+    ],
+    "warnings": [
+      "semantic search pulled dependency directories (venv/site-packages/node_modules)"
+    ],
+    "suggestions": [
+      "exclude .venv/venv/node_modules from repository retrieval scope"
+    ]
+  }
+}
+```
+
+### 5. GET /action/{actionId}
 
 Returns action execution detail with worker ownership, timing, latest structured result, and collected logs.
 
@@ -157,6 +213,8 @@ Example:
 ## CLI Usage
 
 `aiflow status` uses these runtime observability endpoints.
+
+`aiflow summary` uses `GET /workflow/{workflowId}/summary`.
 
 Examples:
 

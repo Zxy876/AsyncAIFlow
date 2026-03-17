@@ -5,9 +5,9 @@ spring:
   application:
     name: asyncaiflow
   datasource:
-    url: jdbc:mysql://localhost:3306/asyncaiflow?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+    url: jdbc:mysql://localhost:3306/asyncaiflow?useSSL=false&serverTimezone=UTC
     username: root
-    password: root
+    password: 
     driver-class-name: com.mysql.cj.jdbc.Driver
   data:
     redis:
@@ -48,3 +48,4 @@ asyncaiflow:
   scheduler:
     action-scan-fixed-delay-ms: 2000
     worker-scan-fixed-delay-ms: 10000
+    max-parallel-actions-per-workflow: 0

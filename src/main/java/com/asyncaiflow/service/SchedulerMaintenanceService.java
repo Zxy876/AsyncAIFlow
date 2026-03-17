@@ -22,6 +22,7 @@ public class SchedulerMaintenanceService {
     public void maintainActions() {
         actionService.reclaimExpiredLeases();
         actionService.enqueueDueRetries();
+        actionService.dispatchAllRunnableActions();
     }
 
     @Scheduled(fixedDelayString = "${asyncaiflow.scheduler.worker-scan-fixed-delay-ms:10000}")

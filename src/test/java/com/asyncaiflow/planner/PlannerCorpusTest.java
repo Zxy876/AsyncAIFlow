@@ -55,9 +55,17 @@ class PlannerCorpusTest {
 
     private List<String> expectedPlanTypesForClassification(String classification) {
         return switch (classification) {
-            case "understanding" -> List.of("search_code", "analyze_module", "generate_explanation");
-            case "review" -> List.of("search_code", "review_code");
-            case "diagnosis" -> List.of("search_code", "analyze_module", "design_solution");
+            case "understanding" -> List.of("search_semantic", "build_context_pack", "generate_explanation");
+            case "review" -> List.of("search_semantic", "load_code", "build_context_pack", "review_code");
+            case "diagnosis" -> List.of(
+                    "search_semantic",
+                    "load_code",
+                    "build_context_pack",
+                    "design_solution",
+                    "generate_patch",
+                    "review_patch",
+                    "apply_patch",
+                    "commit_changes");
             default -> throw new IllegalArgumentException("unknown classification: " + classification);
         };
     }

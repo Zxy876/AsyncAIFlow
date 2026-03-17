@@ -85,9 +85,11 @@ public class OpenAiCompatibleLlmClient {
     private String extractContent(String responseBody) {
         try {
             JsonNode root = objectMapper.readTree(responseBody);
-            JsonNode contentNode = root.path("choices").path(0).path("message").path("content");
+            JsonNode messageNode = root.path("choices").path(0).path("message");
+            JsonNode contentNode = messageNode.path("content");
             if (contentNode.isMissingNode() || contentNode.isNull()) {
-                throw new WorkerClientException("LLM response missing choices[0].message.content");
+                return extractReasoningContent(messageNode, responseBody,
+                        "LLM response missing choices[0].message.content");
             }
 
             if (contentNode.isArray()) {
@@ -109,12 +111,45 @@ public class OpenAiCompatibleLlmClient {
 
             String content = contentNode.asText("").trim();
             if (content.isBlank()) {
-                throw new WorkerClientException("LLM response content is blank");
+                return extractReasoningContent(messageNode, responseBody, "LLM response content is blank");
             }
             return content;
         } catch (IOException exception) {
             throw new WorkerClientException("Failed to parse LLM response body", exception);
         }
+    }
+
+    private String extractReasoningContent(JsonNode messageNode, String responseBody, String defaultMessage) {
+        JsonNode reasoningContentNode = messageNode.path("reasoning_content");
+        String reasoningContent = extractTextContent(reasoningContentNode);
+        if (!reasoningContent.isBlank()) {
+            LOGGER.info("LLM response content was blank; using reasoning_content fallback");
+            return reasoningContent;
+        }
+
+        throw new WorkerClientException(defaultMessage + "; response body: " + summarize(responseBody, 400));
+    }
+
+    private String extractTextContent(JsonNode contentNode) {
+        if (contentNode == null || contentNode.isMissingNode() || contentNode.isNull()) {
+            return "";
+        }
+
+        if (contentNode.isArray()) {
+            StringBuilder builder = new StringBuilder();
+            for (JsonNode part : contentNode) {
+                String text = part.path("text").asText("");
+                if (!text.isBlank()) {
+                    if (builder.length() > 0) {
+                        builder.append('\n');
+                    }
+                    builder.append(text);
+                }
+            }
+            return builder.toString().trim();
+        }
+
+        return contentNode.asText("").trim();
     }
 
     private URI buildUri() {
@@ -128,9 +163,30 @@ public class OpenAiCompatibleLlmClient {
             endpoint = "/v1/chat/completions";
         }
 
+        if (isAbsoluteUrl(endpoint)) {
+            return URI.create(endpoint.trim());
+        }
+
         String normalizedBaseUrl = trimRightSlash(baseUrl);
         String normalizedEndpoint = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
+        normalizedEndpoint = normalizeEndpointForVersionedBaseUrl(normalizedBaseUrl, normalizedEndpoint);
         return URI.create(normalizedBaseUrl + normalizedEndpoint);
+    }
+
+    private String normalizeEndpointForVersionedBaseUrl(String baseUrl, String endpoint) {
+        URI baseUri = URI.create(baseUrl);
+        String basePath = trimRightSlash(baseUri.getPath() == null ? "" : baseUri.getPath());
+        String baseVersionSegment = lastPathSegment(basePath);
+        String endpointVersionSegment = firstPathSegment(endpoint);
+
+        if (!isVersionSegment(baseVersionSegment) || !isVersionSegment(endpointVersionSegment)) {
+            return endpoint;
+        }
+
+        String normalizedEndpoint = trimFirstPathSegment(endpoint);
+        LOGGER.info("LLM endpoint {} normalized to {} because baseUrl {} already contains a version segment",
+                endpoint, normalizedEndpoint, baseUrl);
+        return normalizedEndpoint;
     }
 
     private String mockCompletion(String userPrompt) {
@@ -182,6 +238,64 @@ public class OpenAiCompatibleLlmClient {
             trimmed = trimmed.substring(0, trimmed.length() - 1);
         }
         return trimmed;
+    }
+
+    private static String lastPathSegment(String path) {
+        if (path == null || path.isBlank()) {
+            return "";
+        }
+
+        int lastSlash = path.lastIndexOf('/');
+        return lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+    }
+
+    private static String firstPathSegment(String path) {
+        if (path == null || path.isBlank() || !path.startsWith("/")) {
+            return "";
+        }
+
+        int secondSlash = path.indexOf('/', 1);
+        if (secondSlash < 0) {
+            return path.substring(1);
+        }
+        return path.substring(1, secondSlash);
+    }
+
+    private static String trimFirstPathSegment(String path) {
+        if (path == null || path.isBlank() || !path.startsWith("/")) {
+            return path;
+        }
+
+        int secondSlash = path.indexOf('/', 1);
+        if (secondSlash < 0) {
+            return "/";
+        }
+        return path.substring(secondSlash);
+    }
+
+    private static boolean isAbsoluteUrl(String value) {
+        if (value == null) {
+            return false;
+        }
+
+        String trimmed = value.trim();
+        return trimmed.startsWith("http://") || trimmed.startsWith("https://");
+    }
+
+    private static boolean isVersionSegment(String value) {
+        return value != null && value.matches("v\\d+");
+    }
+
+    private static String summarize(String value, int maxLength) {
+        if (value == null) {
+            return "";
+        }
+
+        String normalized = value.replaceAll("\\s+", " ").trim();
+        if (normalized.length() <= maxLength) {
+            return normalized;
+        }
+        return normalized.substring(0, maxLength) + "...";
     }
 
     private static boolean isBlank(String value) {

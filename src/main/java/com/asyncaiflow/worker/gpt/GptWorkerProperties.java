@@ -14,11 +14,13 @@ public class GptWorkerProperties {
 
     private String workerId = "gpt-worker-1";
 
-        private List<String> capabilities = new ArrayList<>(List.of(
+    private List<String> capabilities = new ArrayList<>(List.of(
             "design_solution",
             "review_code",
-            "generate_explanation"
-        ));
+            "generate_explanation",
+            "generate_patch",
+            "review_patch"
+    ));
 
     private long pollIntervalMillis = 2000L;
 

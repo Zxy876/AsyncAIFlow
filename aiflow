@@ -11,6 +11,7 @@ import pathlib
 import shlex
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -26,8 +27,14 @@ LAST_RUN_FILE_NAME = "last-run.json"
 DEFAULT_CONFIG = {
     "openai_api_key": "",
     "deepseek_api_key": "",
+    "llm_base_url": "",
+    "llm_endpoint": "",
+    "llm_model": "",
+    "llm_api_key": "",
     "runtime_url": "http://localhost:8080",
 }
+
+LOCAL_RUNTIME_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 
 class CliError(Exception):
@@ -99,6 +106,21 @@ def decode_body(raw: bytes) -> tuple[str, Any]:
         return text, text
 
 
+def should_bypass_proxy(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in LOCAL_RUNTIME_HOSTS
+
+
+def open_http_request(request: urllib.request.Request, timeout_seconds: int):
+    if should_bypass_proxy(request.full_url):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(request, timeout=timeout_seconds)
+    return urllib.request.urlopen(request, timeout=timeout_seconds)
+
+
 def http_json(
     method: str,
     url: str,
@@ -115,7 +137,7 @@ def http_json(
 
     request = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with open_http_request(request, timeout_seconds) as response:
             body_text, body_json = decode_body(response.read())
             _ = body_text
             return response.getcode(), body_json
@@ -397,7 +419,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     workflow_name = args.name or f"aiflow-run-{current_timestamp()}"
     workflow_description = args.description or plan_issue or f"Created by aiflow run from {plan_file.name}"
 
-    _ = submit_plan_to_runtime(
+    workflow_id = submit_plan_to_runtime(
         project_root,
         runtime_url,
         plan_file,
@@ -406,6 +428,34 @@ def cmd_run(args: argparse.Namespace) -> int:
         workflow_description,
         show_submission_progress=True,
     )
+
+    print()
+    print(f"Workflow {workflow_id} started")
+    print("-" * 40)
+
+    if args.no_follow:
+        print(f"Use 'aiflow status --workflow-id {workflow_id}' to follow progress.")
+        if not args.no_summary:
+            print(f"Use 'aiflow summary --workflow-id {workflow_id}' to view summary.")
+        return 0
+
+    final_status = stream_workflow_progress(runtime_url, workflow_id)
+
+    if args.no_summary:
+        return 0
+
+    try:
+        summary = fetch_workflow_summary(runtime_url, workflow_id)
+    except CliError as exc:
+        print()
+        print(f"Summary unavailable for workflow {workflow_id}: {exc}")
+        return 0
+
+    print()
+    if final_status == "TIMEOUT":
+        print("Summary (workflow still running; partial view)")
+        print("-" * 40)
+    print_workflow_summary(summary)
     return 0
 
 
@@ -424,6 +474,15 @@ def fetch_workflow_actions(runtime_url: str, workflow_id: int) -> list[dict[str,
     data = unwrap_api_response(body)
     if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
         raise CliError(f"Runtime returned invalid action list for workflow {workflow_id}")
+    return data
+
+
+def fetch_workflow_summary(runtime_url: str, workflow_id: int) -> dict[str, Any]:
+    endpoint = f"{runtime_url}/workflow/{urllib.parse.quote(str(workflow_id), safe='')}/summary"
+    _, body = http_json("GET", endpoint)
+    data = unwrap_api_response(body)
+    if not isinstance(data, dict):
+        raise CliError(f"Runtime returned invalid workflow summary payload for workflow {workflow_id}")
     return data
 
 
@@ -533,7 +592,7 @@ def stream_workflow_progress(
     *,
     poll_interval_seconds: float = 2.0,
     timeout_seconds: int = 300,
-) -> None:
+) -> str:
     start = time.monotonic()
     last_signature: tuple[Any, ...] | None = None
 
@@ -566,11 +625,11 @@ def stream_workflow_progress(
 
         if status in ("COMPLETED", "FAILED"):
             print(f"Workflow {workflow_id} {status.lower()}")
-            return
+            return status
 
         if time.monotonic() - start >= timeout_seconds:
             print(f"Workflow {workflow_id} progress stream timed out after {timeout_seconds} seconds")
-            return
+            return "TIMEOUT"
 
         time.sleep(max(0.5, poll_interval_seconds))
 
@@ -609,12 +668,217 @@ def prompt_int(prompt: str, *, default: int | None = None) -> int | None:
     return int(normalized)
 
 
+def print_action_id_table(actions: list[dict[str, Any]]) -> None:
+    if not actions:
+        print("(no actions)")
+        return
+
+    print(f"{'ACTION_ID':<20} {'TYPE':<20} STATUS")
+    print("-" * 72)
+    for action in actions:
+        action_id = str(action.get("actionId") or "?")
+        step_type = str(action.get("type") or "unknown")
+        status = str(action.get("status") or "UNKNOWN")
+        print(f"{action_id:<20} {step_type:<20} {status}")
+
+
 def pretty_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, indent=2)
     if value is None:
         return "null"
     return str(value)
+
+
+def format_duration_seconds(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, remain = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {remain}s"
+        hours, remain_minutes = divmod(minutes, 60)
+        return f"{hours}h {remain_minutes}m"
+    return "n/a"
+
+
+def print_wrapped_bullet_lines(items: list[Any], *, width: int = 96) -> None:
+    for raw in items:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        wrapped = textwrap.wrap(line, width=max(40, width - 2)) or [line]
+        print(f"- {wrapped[0]}")
+        for continuation in wrapped[1:]:
+            print(f"  {continuation}")
+
+
+def resolve_context_quality(summary: dict[str, Any]) -> dict[str, Any]:
+    context_quality = summary.get("contextQuality")
+    if isinstance(context_quality, dict):
+        return context_quality
+
+    retrieval_total = 0
+    source_total = 0
+    noisy_action_count = 0
+    has_retrieval = False
+    has_source = False
+
+    actions = summary.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            retrieval_count = action.get("retrievalCount")
+            if isinstance(retrieval_count, int):
+                retrieval_total += retrieval_count
+                has_retrieval = True
+
+            source_count = action.get("sourceCount")
+            if isinstance(source_count, int):
+                source_total += source_count
+                has_source = True
+
+            if action.get("noisyRetrieval") is True:
+                noisy_action_count += 1
+
+    quality: dict[str, Any] = {
+        "noiseDetected": noisy_action_count > 0,
+        "noisyActionCount": noisy_action_count,
+    }
+    if has_retrieval:
+        quality["retrievalCount"] = retrieval_total
+    if has_source:
+        quality["sourceCount"] = source_total
+    return quality
+
+
+def print_workflow_summary(summary: dict[str, Any]) -> None:
+    workflow_id = summary.get("workflowId")
+    status = str(summary.get("status") or "UNKNOWN").upper()
+    duration = format_duration_seconds(summary.get("durationSeconds"))
+    issue = str(summary.get("issue") or "").strip()
+
+    print("Workflow Summary")
+    print("-" * 40)
+    print(f"Workflow ID: {workflow_id}")
+    print(f"Status     : {status}")
+    print(f"Duration   : {duration}")
+    if issue:
+        print(f"Issue      : {issue}")
+
+    context_quality = resolve_context_quality(summary)
+    if isinstance(context_quality, dict):
+        retrieval_count = context_quality.get("retrievalCount")
+        source_count = context_quality.get("sourceCount")
+        noise_detected = context_quality.get("noiseDetected") is True
+        noise_summary = str(context_quality.get("noiseSummary") or "").strip()
+        noisy_action_count = context_quality.get("noisyActionCount")
+
+        if (
+            isinstance(retrieval_count, int)
+            or isinstance(source_count, int)
+            or noise_detected
+            or isinstance(noisy_action_count, int)
+            or noise_summary
+        ):
+            print()
+            print("Context Quality")
+            print("-" * 40)
+            if isinstance(retrieval_count, int):
+                print(f"- retrievalCount: {retrieval_count}")
+            if isinstance(source_count, int):
+                print(f"- sourceCount: {source_count}")
+            if isinstance(noisy_action_count, int) and noisy_action_count > 0:
+                print(f"- noisyActions: {noisy_action_count}")
+            if noise_detected:
+                if noise_summary:
+                    print(f"- noise: {noise_summary}")
+                else:
+                    print("- noise: dependency directories detected")
+            elif noise_summary:
+                print(f"- noise: {noise_summary}")
+            else:
+                print("- noise: none detected")
+
+    plan = summary.get("plan")
+    if isinstance(plan, list):
+        print()
+        print("Plan")
+        print("-" * 40)
+        if plan:
+            for index, step in enumerate(plan, start=1):
+                print(f"{index}. {step}")
+        else:
+            print("(no plan steps)")
+
+    actions = summary.get("actions")
+    if isinstance(actions, list):
+        print()
+        print("Results")
+        print("-" * 40)
+        if not actions:
+            print("(no actions)")
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("actionType") or "unknown")
+            action_status = str(action.get("status") or "PENDING")
+            print(f"{action_status_icon(action_status)} {action_type} ({action_status.upper()})")
+
+            action_duration = format_duration_seconds(action.get("durationSeconds"))
+            if action_duration != "n/a":
+                print(f"  duration: {action_duration}")
+
+            detail_items: list[str] = []
+            if isinstance(action.get("matchCount"), int):
+                detail_items.append(f"matches: {action.get('matchCount')}")
+            if isinstance(action.get("sourceCount"), int):
+                detail_items.append(f"sources: {action.get('sourceCount')}")
+            if isinstance(action.get("retrievalCount"), int):
+                detail_items.append(f"retrievalCount: {action.get('retrievalCount')}")
+            if action.get("noisyRetrieval") is True:
+                detail_items.append("noise: dependency dirs detected")
+            if detail_items:
+                print("  " + " | ".join(detail_items))
+
+            short_result = str(action.get("shortResult") or "").strip()
+            if short_result:
+                wrapped_summary = textwrap.wrap(short_result, width=88) or [short_result]
+                print(f"  summary: {wrapped_summary[0]}")
+                for continuation in wrapped_summary[1:]:
+                    print(f"           {continuation}")
+
+    findings = summary.get("keyFindings")
+    if isinstance(findings, list):
+        print()
+        print("Key Findings")
+        print("-" * 40)
+        if findings:
+            print_wrapped_bullet_lines(findings)
+        else:
+            print("(none)")
+
+    warnings = summary.get("warnings")
+    if isinstance(warnings, list):
+        print()
+        print("Issues")
+        print("-" * 40)
+        if warnings:
+            print_wrapped_bullet_lines(warnings)
+        else:
+            print("(none)")
+
+    suggestions = summary.get("suggestions")
+    if isinstance(suggestions, list):
+        print()
+        print("Suggestions")
+        print("-" * 40)
+        if suggestions:
+            print_wrapped_bullet_lines(suggestions)
+        else:
+            print("(none)")
 
 
 def mask_secret(value: str) -> str:
@@ -669,6 +933,18 @@ def interactive_new_issue(project_root: pathlib.Path, runtime_url: str) -> None:
     print("-" * 40)
     stream_workflow_progress(runtime_url, workflow_id)
 
+    try:
+        actions = fetch_workflow_actions(runtime_url, workflow_id)
+    except CliError as exc:
+        print(f"Cannot fetch action list for workflow {workflow_id}: {exc}")
+        return
+
+    print()
+    print("Action IDs")
+    print("-" * 40)
+    print_action_id_table(actions)
+    print("Use [5] Action Detail and enter an Action ID above.")
+
 
 def interactive_recent_workflows(runtime_url: str) -> None:
     print("\nRecent Workflows")
@@ -677,6 +953,8 @@ def interactive_recent_workflows(runtime_url: str) -> None:
     limit = prompt_int("Limit (default 10): ", default=10)
     if limit is None:
         limit = 10
+    if limit < 1 or limit > 200:
+        raise CliError("Limit must be between 1 and 200")
     workflows = fetch_recent_workflows(runtime_url, limit=limit)
     if not workflows:
         print("(no workflows)")
@@ -721,6 +999,22 @@ def interactive_workflow_status(project_root: pathlib.Path, runtime_url: str) ->
     print_workflow_action_lines(workflow_actions, marker=action_status_marker_ascii)
 
 
+def interactive_workflow_summary(project_root: pathlib.Path, runtime_url: str) -> None:
+    print("\nWorkflow Summary")
+    print("-" * 40)
+    raw = prompt_input("Workflow ID (blank = latest): ")
+    explicit_id = parse_numeric_id(raw.strip()) if raw is not None and raw.strip() else None
+    if raw is not None and raw.strip() and explicit_id is None:
+        raise CliError(f"Invalid workflow id: {raw.strip()}")
+
+    workflow_id = resolve_workflow_id(project_root, runtime_url, explicit_id)
+    if workflow_id is None:
+        raise CliError("No workflow id provided and runtime has no recent workflows")
+
+    summary = fetch_workflow_summary(runtime_url, workflow_id)
+    print_workflow_summary(summary)
+
+
 def interactive_action_detail(runtime_url: str) -> None:
     print("\nAction Detail")
     print("-" * 40)
@@ -729,7 +1023,24 @@ def interactive_action_detail(runtime_url: str) -> None:
         print("Action ID is required.")
         return
 
-    detail = fetch_action_execution(runtime_url, action_id)
+    try:
+        detail = fetch_action_execution(runtime_url, action_id)
+    except CliError as exc:
+        message = str(exc)
+        if "HTTP 404" in message and "Action not found" in message:
+            try:
+                workflow_actions = fetch_workflow_actions(runtime_url, action_id)
+            except CliError:
+                raise
+
+            print(
+                f"Input {action_id} looks like a Workflow ID, not an Action ID."
+            )
+            print("Available Action IDs in that workflow:")
+            print_action_id_table(workflow_actions)
+            print("Please run Action Detail again with one of the ACTION_ID values above.")
+            return
+        raise
 
     print(f"Action ID : {detail.get('actionId')}")
     print(f"Workflow  : {detail.get('workflowId')}")
@@ -812,6 +1123,18 @@ def interactive_run_plan_file(project_root: pathlib.Path, runtime_url: str) -> N
     print("-" * 40)
     stream_workflow_progress(runtime_url, workflow_id)
 
+    try:
+        actions = fetch_workflow_actions(runtime_url, workflow_id)
+    except CliError as exc:
+        print(f"Cannot fetch action list for workflow {workflow_id}: {exc}")
+        return
+
+    print()
+    print("Action IDs")
+    print("-" * 40)
+    print_action_id_table(actions)
+    print("Use [5] Action Detail and enter an Action ID above.")
+
 
 def interactive_settings(project_root: pathlib.Path) -> None:
     while True:
@@ -821,10 +1144,18 @@ def interactive_settings(project_root: pathlib.Path) -> None:
         print(f"runtime_url      : {config.get('runtime_url', '')}")
         print(f"openai_api_key   : {mask_secret(str(config.get('openai_api_key', '')))}")
         print(f"deepseek_api_key : {mask_secret(str(config.get('deepseek_api_key', '')))}")
+        print(f"llm_base_url     : {config.get('llm_base_url', '') or '(empty)'}")
+        print(f"llm_endpoint     : {config.get('llm_endpoint', '') or '(empty)'}")
+        print(f"llm_model        : {config.get('llm_model', '') or '(empty)'}")
+        print(f"llm_api_key      : {mask_secret(str(config.get('llm_api_key', '')))}")
         print()
         print("[1] Edit runtime_url")
         print("[2] Edit openai_api_key")
         print("[3] Edit deepseek_api_key")
+        print("[4] Edit llm_base_url")
+        print("[5] Edit llm_endpoint")
+        print("[6] Edit llm_model")
+        print("[7] Edit llm_api_key")
         print("[0] Back")
 
         choice = prompt_input("Select > ")
@@ -855,6 +1186,30 @@ def interactive_settings(project_root: pathlib.Path) -> None:
                 return
             if value.strip():
                 config["deepseek_api_key"] = value.strip()
+        elif normalized == "4":
+            value = prompt_input("llm_base_url (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["llm_base_url"] = value.strip()
+        elif normalized == "5":
+            value = prompt_input("llm_endpoint (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["llm_endpoint"] = value.strip()
+        elif normalized == "6":
+            value = prompt_input("llm_model (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["llm_model"] = value.strip()
+        elif normalized == "7":
+            value = prompt_input("llm_api_key (blank keeps current): ")
+            if value is None:
+                return
+            if value.strip():
+                config["llm_api_key"] = value.strip()
         else:
             print("Unknown menu option")
             continue
@@ -881,9 +1236,10 @@ def cmd_interactive(_args: argparse.Namespace) -> int:
         print("[1] New Issue")
         print("[2] Recent Workflows")
         print("[3] Workflow Status")
-        print("[4] Action Detail")
-        print("[5] Run Plan File")
-        print("[6] Settings")
+        print("[4] Workflow Summary")
+        print("[5] Action Detail")
+        print("[6] Run Plan File")
+        print("[7] Settings")
         print("[0] Exit")
 
         choice = prompt_input("Select > ")
@@ -900,10 +1256,12 @@ def cmd_interactive(_args: argparse.Namespace) -> int:
             elif normalized == "3":
                 interactive_workflow_status(project_root, runtime_url)
             elif normalized == "4":
-                interactive_action_detail(runtime_url)
+                interactive_workflow_summary(project_root, runtime_url)
             elif normalized == "5":
-                interactive_run_plan_file(project_root, runtime_url)
+                interactive_action_detail(runtime_url)
             elif normalized == "6":
+                interactive_run_plan_file(project_root, runtime_url)
+            elif normalized == "7":
                 interactive_settings(project_root)
             elif normalized == "0":
                 print("Bye")
@@ -954,6 +1312,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_summary(args: argparse.Namespace) -> int:
+    project_root = require_initialized_root()
+    config = load_config(project_root)
+    runtime_url = runtime_url_from_config(config)
+
+    workflow_id = resolve_workflow_id(project_root, runtime_url, args.workflow_id)
+    if workflow_id is None:
+        raise CliError("No workflow id provided, no .aiflow/last-run.json found, and runtime returned no recent workflows.")
+
+    summary = fetch_workflow_summary(runtime_url, workflow_id)
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    print_workflow_summary(summary)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aiflow",
@@ -982,12 +1358,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("plan_file", help="Path to plan JSON file")
     run_parser.add_argument("--name", help="Workflow name override")
     run_parser.add_argument("--description", help="Workflow description override")
+    run_parser.add_argument("--no-follow", action="store_true", help="Submit workflow only, without progress streaming")
+    run_parser.add_argument("--no-summary", action="store_true", help="Do not fetch and print summary after run")
     run_parser.set_defaults(handler=cmd_run)
 
     status_parser = subparsers.add_parser("status", help="Query workflow status from runtime")
     status_parser.add_argument("--workflow-id", type=int, help="Workflow id to query")
     status_parser.add_argument("--json", action="store_true", help="Print status payload as JSON")
     status_parser.set_defaults(handler=cmd_status)
+
+    summary_parser = subparsers.add_parser("summary", help="Show aggregated workflow summary")
+    summary_parser.add_argument("--workflow-id", type=int, help="Workflow id to summarize")
+    summary_parser.add_argument("--json", action="store_true", help="Print summary payload as JSON")
+    summary_parser.set_defaults(handler=cmd_summary)
 
     interactive_parser = subparsers.add_parser("interactive", help="Start interactive ASCII workflow console")
     interactive_parser.set_defaults(handler=cmd_interactive)

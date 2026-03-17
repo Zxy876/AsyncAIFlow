@@ -1,7 +1,10 @@
 package com.asyncaiflow;
 
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -139,6 +142,65 @@ class RuntimeObservabilityApiIntegrationTest {
                                 .andExpect(jsonPath("$.data.logs", hasSize(2)))
                                 .andExpect(jsonPath("$.data.logs[0].status", is("SUCCEEDED")))
                                 .andExpect(jsonPath("$.data.logs[1].result.summary").value("fresh"));
+    }
+
+    @Test
+    void getWorkflowSummaryReturnsAggregatedActionOutputs() throws Exception {
+        LocalDateTime base = LocalDateTime.of(2026, 3, 16, 7, 30, 0);
+        insertWorkflow(501L, base.minusMinutes(1), "Explain runtime_ir module in drift");
+        insertAction(5001L, 501L, "search_semantic", "SUCCEEDED", "repository-worker", "{}",
+                base.minusSeconds(20), base.minusSeconds(18), base.minusSeconds(15), null);
+        insertAction(5002L, 501L, "build_context_pack", "SUCCEEDED", "repository-worker", "{}",
+                base.minusSeconds(15), base.minusSeconds(14), base.minusSeconds(10), null);
+        insertAction(5003L, 501L, "generate_explanation", "SUCCEEDED", "gpt-worker", "{}",
+                base.minusSeconds(9), base.minusSeconds(8), base.minusSeconds(2), null);
+
+        insertActionLog(
+                9501L,
+                5001L,
+                "repository-worker",
+                "{\"matchCount\":5,\"matches\":[{\"path\":\"godot-runtime/backend/venv/lib/python3.14/site-packages/pydantic/v1/_hypothesis_plugin.py\"}]}",
+                "SUCCEEDED",
+                base.minusSeconds(15)
+        );
+        insertActionLog(
+                9502L,
+                5002L,
+                "repository-worker",
+                "{\"sourceCount\":3,\"retrievalCount\":5,\"summary\":\"Context pack assembled from 3 files\"}",
+                "SUCCEEDED",
+                base.minusSeconds(10)
+        );
+        insertActionLog(
+                9503L,
+                5003L,
+                "gpt-worker",
+                "{\"summary\":\"结论: runtime_ir is an intermediate representation layer\\n发现: it coordinates downstream runtime actions\\n代码位置: backend/app/core/runtime_ir.py\\n风险: low\"}",
+                "SUCCEEDED",
+                base.minusSeconds(2)
+        );
+
+        mockMvc.perform(get("/workflow/{workflowId}/summary", 501L))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.workflowId").value(501))
+                .andExpect(jsonPath("$.data.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.durationSeconds", notNullValue()))
+                .andExpect(jsonPath("$.data.plan", hasSize(3)))
+                .andExpect(jsonPath("$.data.plan[0]").value("search_semantic"))
+                .andExpect(jsonPath("$.data.actions", hasSize(3)))
+                .andExpect(jsonPath("$.data.actions[0].matchCount").value(5))
+                .andExpect(jsonPath("$.data.actions[0].noisyRetrieval").value(true))
+                .andExpect(jsonPath("$.data.actions[1].sourceCount").value(3))
+                .andExpect(jsonPath("$.data.actions[1].retrievalCount").value(5))
+                .andExpect(jsonPath("$.data.contextQuality.retrievalCount").value(5))
+                .andExpect(jsonPath("$.data.contextQuality.sourceCount").value(3))
+                .andExpect(jsonPath("$.data.contextQuality.noisyActionCount").value(1))
+                .andExpect(jsonPath("$.data.contextQuality.noiseDetected").value(true))
+                .andExpect(jsonPath("$.data.keyFindings", hasItem(containsString("runtime_ir"))))
+                .andExpect(jsonPath("$.data.keyFindings[0]", not(containsString("结论"))))
+                .andExpect(jsonPath("$.data.warnings", hasItem(containsString("semantic search pulled dependency directories"))))
+                .andExpect(jsonPath("$.data.suggestions", hasItem(containsString("exclude .venv/venv/node_modules"))));
     }
 
         private void insertWorkflow(Long workflowId, LocalDateTime createdAt, String description) {

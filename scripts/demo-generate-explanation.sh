@@ -56,7 +56,7 @@ plan = planner_plan_root.get('plan')
 if not isinstance(plan, list):
     raise SystemExit('[demo-generate-explanation] invalid planner response: missing plan array')
 
-expected_chain = ['search_code', 'analyze_module', 'generate_explanation']
+expected_chain = ['search_semantic', 'build_context_pack', 'generate_explanation']
 actual_chain = [step.get('type', '') for step in plan]
 
 if len(actual_chain) < 3 or actual_chain[:3] != expected_chain:
@@ -87,7 +87,7 @@ runtime_plan = {
 with open(runtime_plan_path, 'w', encoding='utf-8') as handle:
     json.dump(runtime_plan, handle, ensure_ascii=False, indent=2)
 
-print('[demo-generate-explanation] planner chain verified: search_code -> analyze_module -> generate_explanation')
+print('[demo-generate-explanation] planner chain verified: search_semantic -> build_context_pack -> generate_explanation')
 print('[demo-generate-explanation] runtime plan prepared with 1 executable step: generate_explanation')
 PY
 

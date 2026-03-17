@@ -5,10 +5,9 @@ services:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: asyncaiflow
     ports:
-      - "3306:3306"
-    command: --default-authentication-plugin=mysql_native_password
+      - "${ASYNCAIFLOW_MYSQL_PORT:-3306}:3306"
     volumes:
-      - mysql-data:/var/lib/mysql
+      - mysql-data-v2:/var/lib/mysql
     healthcheck:
       test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot" ]
       interval: 10s
@@ -29,5 +28,5 @@ services:
       retries: 10
 
 volumes:
-  mysql-data:
+  mysql-data-v2:
   redis-data:

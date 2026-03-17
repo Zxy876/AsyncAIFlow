@@ -281,8 +281,89 @@ Worker Milestone 1 repository worker:
 mvn spring-boot:run -Dapp.main.class=com.asyncaiflow.worker.repository.RepositoryWorkerApplication -Dspring-boot.run.profiles=repository-worker
 ```
 
-This worker registers `search_code` and `read_file`. Runtime dispatch also maps `analyze_module` to `read_file` capability so planner-style explanation workflows can execute without changing planner logic.
+This worker now registers `search_code`, `read_file`, `search_semantic`, and `build_context_pack`.
 
+Planner-style explanation and diagnosis flows now use semantic retrieval first:
+
+- `search_semantic`
+- `build_context_pack`
+- `generate_explanation` or `design_solution`
+
+Zread MCP can be enabled via `application-repository-worker.yml` / environment variables:
+
+- `ASYNCAIFLOW_ZREAD_MCP_ENDPOINT`
+- `ASYNCAIFLOW_ZREAD_AUTHORIZATION`
+
+The repository worker now defaults to `https://open.bigmodel.cn/api/mcp/zread/mcp` and will reuse `OPENAI_API_KEY` when `ASYNCAIFLOW_ZREAD_AUTHORIZATION` is not set.
+
+When Zread MCP is disabled or unavailable, `search_semantic` gracefully falls back to local semantic-like scoring over workspace files.
+
+## Workflow Summary Demo
+
+`aiflow run` now follows execution in real time and prints a structured summary automatically when the workflow finishes. No separate `aiflow summary` call needed.
+
+```bash
+./aiflow run plan.json
+```
+
+```text
+[+] Workflow submitted: 2033325050694475777
+
+ Workflow 2033325050694475777 · RUNNING
+ [00:03] ✓ search_semantic         COMPLETED
+ [00:08] ✓ build_context_pack      COMPLETED
+ [00:31] ✓ generate_explanation    COMPLETED
+ Workflow COMPLETED in 31s
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  WORKFLOW SUMMARY  ·  #2033325050694475777  ·  COMPLETED  ·  31s           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Issue    Fix authentication module race condition
+
+Plan
+  1. search_semantic   2. build_context_pack   3. generate_explanation
+
+Actions (3)
+  ✓ search_semantic          [3s]   Found 6 relevant files across auth package
+  ✓ build_context_pack       [5s]   Compiled context from 6 sources
+  ✓ generate_explanation     [23s]  Race condition identified in SessionManager
+
+Context Quality
+  retrievals : 6       sources : 6
+  noise      : none
+
+Key Findings
+  • Race condition in SessionManager.validateToken() — concurrent token refresh
+    can bypass expiry check
+  • Affected call site: src/auth/SessionManager.java:142
+
+Warnings
+  • Token refresh and validation share a non-atomic check-then-act block
+
+Suggestions
+  • Add synchronized block or use AtomicReference for token state
+```
+
+To skip the summary after run:
+
+```bash
+./aiflow run plan.json --no-summary
+```
+
+To submit and return immediately (no progress streaming):
+
+```bash
+./aiflow run plan.json --no-follow
+```
+
+To view the summary for any workflow at any time:
+
+```bash
+./aiflow summary --workflow-id <id>
+```
+
+Full summary API design is in [docs/runtime-observability.md](docs/runtime-observability.md).
 
 ## Minimal API flow
 

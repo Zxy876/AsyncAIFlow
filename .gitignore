@@ -4,6 +4,7 @@
 /.mvn/
 /.DS_Store
 /*.log
+/logs/
 /.env
 /.aiflow/
 /node_modules/

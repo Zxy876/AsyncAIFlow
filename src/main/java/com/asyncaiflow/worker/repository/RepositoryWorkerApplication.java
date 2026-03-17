@@ -57,6 +57,18 @@ public class RepositoryWorkerApplication {
                     properties.getValidation().getSchemaBasePath());
             ActionSchemaValidator schemaValidator = new ActionSchemaValidator(objectMapper, schemaResolver);
             RepositoryWorkerProperties.RepositoryProperties repository = properties.getRepository();
+            RepositoryWorkerProperties.SemanticProperties semantic = properties.getSemantic();
+            RepositoryWorkerProperties.ZreadProperties zread = semantic.getZread();
+
+            ZreadMcpClient zreadMcpClient = null;
+            if (zread != null && zread.isEnabled()) {
+                zreadMcpClient = new ZreadMcpClient(
+                        objectMapper,
+                        zread.getEndpoint(),
+                        zread.getAuthorization(),
+                        Duration.ofMillis(Math.max(1000L, zread.getTimeoutMillis())),
+                        zread.getToolNames());
+            }
 
             WorkerLoop workerLoop = new WorkerLoop(
                     workerConfig,
@@ -68,7 +80,11 @@ public class RepositoryWorkerApplication {
                             properties.getValidation().getMode(),
                             repository.getMaxSearchResults(),
                             repository.getMaxReadBytes(),
-                            repository.getIgnoredDirectories())
+                            repository.getIgnoredDirectories(),
+                            semantic.getDefaultTopK(),
+                            semantic.getMaxContextFiles(),
+                            semantic.getMaxCharsPerFile(),
+                            zreadMcpClient)
             );
             workerLoop.runForever();
         };

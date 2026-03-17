@@ -102,42 +102,138 @@ class GptWorkerSchemaValidationIntegrationTest {
         assertEquals(1, resultNode.path("findings").size());
     }
 
-        @Test
-        void generateExplanationMockModeReturnsClearlyMarkedStructuredResult() throws Exception {
-                GptWorkerProperties.LlmProperties llmProperties = new GptWorkerProperties.LlmProperties();
-                llmProperties.setMockFallbackEnabled(true);
+    @Test
+    void generatePatchReturnsExtractedPatchResult() throws Exception {
+        String completion = """
+                结论
+                需要最小修复 TODO 分支。
 
-                GptWorkerActionHandler handler = newHandler(
-                                SchemaValidationMode.STRICT,
-                                "schemas/v1",
-                                new OpenAiCompatibleLlmClient(OBJECT_MAPPER, llmProperties));
+                修改文件
+                - src/main/java/demo/SceneRuntime.java
 
-                WorkerExecutionResult result = handler.execute(action("generate_explanation",
-                                """
-                                {
-                                    \"schemaVersion\":\"v1\",
-                                    \"issue\":\"Explain how Drift story engine interacts with the Minecraft plugin\",
-                                    \"repo_context\":\"DriftSystem backend story routes and Minecraft plugin integration\",
-                                    \"file\":\"backend/app/routers/story.py\",
-                                    \"module\":\"story engine\",
-                                    \"gathered_context\":{
-                                        \"plugin_classes\":[\"StoryCreativeManager\",\"IntentRouter2\"],
-                                        \"backend_routes\":[\"backend/app/routers/story.py\"]
-                                    }
-                                }
-                                """));
+                统一补丁
+                ```diff
+                diff --git a/src/main/java/demo/SceneRuntime.java b/src/main/java/demo/SceneRuntime.java
+                --- a/src/main/java/demo/SceneRuntime.java
+                +++ b/src/main/java/demo/SceneRuntime.java
+                @@ -1,3 +1,3 @@
+                 class SceneRuntime {
+                -  String next() { return \"TODO\"; }
+                +  String next() { return \"scene-ready\"; }
+                 }
+                ```
 
-                assertEquals("SUCCEEDED", result.status());
+                风险
+                低。
+                """;
 
-                JsonNode resultNode = OBJECT_MAPPER.readTree(result.result());
-                assertEquals("v1", resultNode.path("schemaVersion").asText());
-                assertEquals("gpt-worker", resultNode.path("worker").asText());
-                assertEquals("gpt-4.1-mini", resultNode.path("model").asText());
-                assertTrue(resultNode.path("summary").asText().contains("[MOCK_EXPLANATION]"));
-                assertTrue(resultNode.path("content").asText().contains("[MOCK_EXPLANATION]"));
-                assertTrue(resultNode.path("content").asText().contains("generate_explanation"));
-                assertTrue(resultNode.path("confidence").asDouble() > 0D);
-        }
+        GptWorkerActionHandler handler = newHandler(SchemaValidationMode.STRICT, "schemas/v1", completion);
+
+        WorkerExecutionResult result = handler.execute(action("generate_patch",
+                """
+                {
+                  "schemaVersion":"v1",
+                  "issue":"Fix TODO in SceneRuntime",
+                  "file":"src/main/java/demo/SceneRuntime.java",
+                  "code":"class SceneRuntime { String next() { return \\\"TODO\\\"; } }"
+                }
+                """));
+
+        assertEquals("SUCCEEDED", result.status(), result.errorMessage());
+        JsonNode resultNode = OBJECT_MAPPER.readTree(result.result());
+        assertTrue(resultNode.path("patch").asText().contains("scene-ready"));
+        assertEquals("src/main/java/demo/SceneRuntime.java", resultNode.path("targetFiles").get(0).asText());
+    }
+
+    @Test
+    void reviewPatchReturnsApprovedPatchResult() throws Exception {
+        String completion = """
+                结论
+                补丁可以应用。
+
+                发现
+                变更范围最小。
+
+                是否可应用
+                可以应用。
+
+                修订补丁
+                ```diff
+                diff --git a/src/main/java/demo/SceneRuntime.java b/src/main/java/demo/SceneRuntime.java
+                --- a/src/main/java/demo/SceneRuntime.java
+                +++ b/src/main/java/demo/SceneRuntime.java
+                @@ -1,3 +1,3 @@
+                 class SceneRuntime {
+                -  String next() { return \"TODO\"; }
+                +  String next() { return \"scene-ready\"; }
+                 }
+                ```
+
+                风险
+                低。
+                """;
+    String patch = """
+        diff --git a/src/main/java/demo/SceneRuntime.java b/src/main/java/demo/SceneRuntime.java
+        --- a/src/main/java/demo/SceneRuntime.java
+        +++ b/src/main/java/demo/SceneRuntime.java
+        @@ -1,3 +1,3 @@
+         class SceneRuntime {
+        -  String next() { return \"TODO\"; }
+        +  String next() { return \"scene-ready\"; }
+         }
+        """;
+
+        GptWorkerActionHandler handler = newHandler(SchemaValidationMode.STRICT, "schemas/v1", completion);
+
+        WorkerExecutionResult result = handler.execute(action("review_patch",
+        OBJECT_MAPPER.writeValueAsString(java.util.Map.of(
+            "schemaVersion", "v1",
+            "issue", "Fix TODO in SceneRuntime",
+            "patch", patch))));
+
+        assertEquals("SUCCEEDED", result.status(), result.errorMessage());
+        JsonNode resultNode = OBJECT_MAPPER.readTree(result.result());
+        assertTrue(resultNode.path("approved").asBoolean());
+        assertTrue(resultNode.path("patch").asText().contains("scene-ready"));
+        assertEquals(1, resultNode.path("findings").size());
+    }
+
+    @Test
+    void generateExplanationMockModeReturnsClearlyMarkedStructuredResult() throws Exception {
+        GptWorkerProperties.LlmProperties llmProperties = new GptWorkerProperties.LlmProperties();
+        llmProperties.setMockFallbackEnabled(true);
+
+        GptWorkerActionHandler handler = newHandler(
+                SchemaValidationMode.STRICT,
+                "schemas/v1",
+                new OpenAiCompatibleLlmClient(OBJECT_MAPPER, llmProperties));
+
+        WorkerExecutionResult result = handler.execute(action("generate_explanation",
+                """
+                {
+                    \"schemaVersion\":\"v1\",
+                    \"issue\":\"Explain how Drift story engine interacts with the Minecraft plugin\",
+                    \"repo_context\":\"DriftSystem backend story routes and Minecraft plugin integration\",
+                    \"file\":\"backend/app/routers/story.py\",
+                    \"module\":\"story engine\",
+                    \"gathered_context\":{
+                        \"plugin_classes\":[\"StoryCreativeManager\",\"IntentRouter2\"],
+                        \"backend_routes\":[\"backend/app/routers/story.py\"]
+                    }
+                }
+                """));
+
+        assertEquals("SUCCEEDED", result.status());
+
+        JsonNode resultNode = OBJECT_MAPPER.readTree(result.result());
+        assertEquals("v1", resultNode.path("schemaVersion").asText());
+        assertEquals("gpt-worker", resultNode.path("worker").asText());
+        assertEquals("gpt-4.1-mini", resultNode.path("model").asText());
+        assertTrue(resultNode.path("summary").asText().contains("[MOCK_EXPLANATION]"));
+        assertTrue(resultNode.path("content").asText().contains("[MOCK_EXPLANATION]"));
+        assertTrue(resultNode.path("content").asText().contains("generate_explanation"));
+        assertTrue(resultNode.path("confidence").asDouble() > 0D);
+    }
 
     @Test
     void resultSchemaInvalidWarnModeLogsWarningAndContinues() {
@@ -180,9 +276,9 @@ class GptWorkerSchemaValidationIntegrationTest {
         OpenAiCompatibleLlmClient llmClient = new StubLlmClient(completion, llmProperties);
 
         return newHandler(mode, schemaBasePath, llmClient);
-        }
+    }
 
-        private static GptWorkerActionHandler newHandler(
+    private static GptWorkerActionHandler newHandler(
             SchemaValidationMode mode,
             String schemaBasePath,
             OpenAiCompatibleLlmClient llmClient) {

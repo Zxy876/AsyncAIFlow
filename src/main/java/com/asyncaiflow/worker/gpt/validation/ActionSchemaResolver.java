@@ -32,6 +32,20 @@ public class ActionSchemaResolver {
             ));
         }
 
+        if ("generate_patch".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                schemaPath("generate_patch.payload.schema.json"),
+                schemaPath("generate_patch.result.schema.json")
+            ));
+        }
+
+        if ("review_patch".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                schemaPath("review_patch.payload.schema.json"),
+                schemaPath("review_patch.result.schema.json")
+            ));
+        }
+
         if ("search_code".equals(actionType)) {
             return Optional.of(new SchemaMapping(
                     schemaPath("search_code.payload.schema.json"),
@@ -43,6 +57,48 @@ public class ActionSchemaResolver {
             return Optional.of(new SchemaMapping(
                     schemaPath("read_file.payload.schema.json"),
                     schemaPath("read_file.result.schema.json")
+            ));
+        }
+
+        if ("load_code".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                schemaPath("load_code.payload.schema.json"),
+                schemaPath("load_code.result.schema.json")
+            ));
+        }
+
+        if ("search_semantic".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                    schemaPath("search_semantic.payload.schema.json"),
+                    schemaPath("search_semantic.result.schema.json")
+            ));
+        }
+
+        if ("build_context_pack".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                    schemaPath("build_context_pack.payload.schema.json"),
+                    schemaPath("build_context_pack.result.schema.json")
+            ));
+        }
+
+        if ("create_branch".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                    schemaPath("create_branch.payload.schema.json"),
+                    schemaPath("create_branch.result.schema.json")
+            ));
+        }
+
+        if ("apply_patch".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                    schemaPath("apply_patch.payload.schema.json"),
+                    schemaPath("apply_patch.result.schema.json")
+            ));
+        }
+
+        if ("commit_changes".equals(actionType)) {
+            return Optional.of(new SchemaMapping(
+                    schemaPath("commit_changes.payload.schema.json"),
+                    schemaPath("commit_changes.result.schema.json")
             ));
         }
 

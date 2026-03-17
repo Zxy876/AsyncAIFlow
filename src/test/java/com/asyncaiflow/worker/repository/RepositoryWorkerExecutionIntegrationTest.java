@@ -162,6 +162,75 @@ class RepositoryWorkerExecutionIntegrationTest {
     }
 
     @Test
+    void searchSemanticAndContextPackActionsCanExecuteAndSubmitResult() throws Exception {
+        Path roadmap = writeWorkspaceFile(
+                "docs/roadmap.md",
+                "Near-term priorities include streaming support and persistence.\nHuman-in-the-loop remains planned.\n");
+        String relativeRoadmap = workspaceRoot.relativize(roadmap).toString().replace('\\', '/');
+
+        String semanticWorkerId = "repository-semantic-worker";
+        String contextWorkerId = "repository-context-worker";
+        workerService.register(new RegisterWorkerRequest(semanticWorkerId, List.of("search_semantic")));
+        workerService.register(new RegisterWorkerRequest(contextWorkerId, List.of("build_context_pack")));
+
+        WorkflowResponse workflow = workflowService.createWorkflow(
+                new CreateWorkflowRequest("semantic-context-demo", "repository semantic/context integration test"));
+
+        ActionResponse semanticAction = actionService.createAction(new CreateActionRequest(
+                workflow.id(),
+                "search_semantic",
+                objectMapper.writeValueAsString(Map.of(
+                        "schemaVersion", "v1",
+                        "query", "streaming support persistence",
+                        "topK", 3,
+                        "scope", Map.of("paths", List.of("docs")))),
+                List.of(),
+                1,
+                1,
+                120
+        ));
+
+        ActionResponse contextAction = actionService.createAction(new CreateActionRequest(
+                workflow.id(),
+                "build_context_pack",
+                objectMapper.writeValueAsString(Map.of(
+                        "schemaVersion", "v1",
+                        "issue", "Find pending roadmap priorities",
+                        "query", "streaming support persistence",
+                        "maxFiles", 2,
+                        "maxCharsPerFile", 1000,
+                        "retrievalResults", List.of(Map.of(
+                                "path", relativeRoadmap,
+                                "score", 0.91,
+                                "chunk", "Near-term priorities include streaming support and persistence.")))),
+                List.of(semanticAction.id()),
+                1,
+                1,
+                120
+        ));
+
+        processAssignment(semanticWorkerId, newRepositoryHandler(), "search_semantic");
+        processAssignment(contextWorkerId, newRepositoryHandler(), "build_context_pack");
+
+        JsonNode semanticNode = loadSingleResultNode(semanticAction.id());
+        assertEquals("local_fallback", semanticNode.path("engine").asText());
+        assertTrue(semanticNode.path("matchCount").asInt() >= 1);
+                boolean containsRoadmap = false;
+                for (JsonNode matchNode : semanticNode.path("matches")) {
+                        if (matchNode.path("path").asText().contains("docs/roadmap.md")) {
+                                containsRoadmap = true;
+                                break;
+                        }
+                }
+                assertTrue(containsRoadmap);
+
+        JsonNode contextNode = loadSingleResultNode(contextAction.id());
+        assertEquals("payload", contextNode.path("engine").asText());
+        assertTrue(contextNode.path("sourceCount").asInt() >= 1);
+        assertTrue(contextNode.path("sources").get(0).path("content").asText().contains("streaming support"));
+    }
+
+    @Test
     void readFileActionCanExecuteAndSubmitResult() throws Exception {
         Path sourceFile = writeWorkspaceFile("src/demo/MappingService.java", "class MappingService {\n  void map() {}\n}\n");
         String workerId = "repository-read-worker";
@@ -213,6 +282,59 @@ class RepositoryWorkerExecutionIntegrationTest {
     }
 
     @Test
+    void loadCodeActionCanExecuteAndSubmitResult() throws Exception {
+        Path sourceFile = writeWorkspaceFile("src/demo/SceneRuntime.java", "class SceneRuntime {\n  void tick() {}\n}\n");
+        String workerId = "repository-load-code-worker";
+        workerService.register(new RegisterWorkerRequest(workerId, List.of("load_code")));
+
+        WorkflowResponse workflow = workflowService.createWorkflow(
+                new CreateWorkflowRequest("load-code-demo", "repository worker load_code integration test"));
+
+        String payload = objectMapper.writeValueAsString(Map.of(
+                "schemaVersion", "v1",
+                "paths", List.of(workspaceRoot.relativize(sourceFile).toString().replace('\\', '/')),
+                "maxFiles", 1,
+                "maxCharsPerFile", 1000));
+
+        ActionResponse action = actionService.createAction(new CreateActionRequest(
+                workflow.id(),
+                "load_code",
+                payload,
+                List.of(),
+                1,
+                1,
+                120
+        ));
+
+        Optional<ActionAssignmentResponse> assignment = actionService.pollAction(workerId);
+        assertTrue(assignment.isPresent());
+        assertEquals("load_code", assignment.get().type());
+
+        WorkerExecutionResult executionResult = newRepositoryHandler().execute(new ActionAssignment(
+                assignment.get().actionId(),
+                assignment.get().workflowId(),
+                assignment.get().type(),
+                assignment.get().payload(),
+                assignment.get().retryCount(),
+                assignment.get().leaseExpireAt()));
+
+        ActionResponse submitted = actionService.submitResult(new SubmitActionResultRequest(
+                workerId,
+                action.id(),
+                executionResult.status(),
+                executionResult.result(),
+                executionResult.errorMessage()
+        ));
+
+        assertEquals(ActionStatus.SUCCEEDED.name(), submitted.status());
+
+        JsonNode resultNode = loadSingleResultNode(action.id());
+        assertEquals(1, resultNode.path("loadedFileCount").asInt());
+        assertEquals("src/demo/SceneRuntime.java", resultNode.path("files").get(0).path("path").asText());
+        assertTrue(resultNode.path("code").asText().contains("class SceneRuntime"));
+    }
+
+    @Test
     void repositoryWorkerAndGptWorkerCanExecutePlannerStyleDag() throws Exception {
         Path sourceFile = writeWorkspaceFile(
                 "src/demo/ResourceMapper.java",
@@ -220,7 +342,9 @@ class RepositoryWorkerExecutionIntegrationTest {
 
         String repositoryWorkerId = "repository-worker-1";
         String gptWorkerId = "gpt-worker-1";
-        workerService.register(new RegisterWorkerRequest(repositoryWorkerId, List.of("search_code", "read_file")));
+        workerService.register(new RegisterWorkerRequest(
+                repositoryWorkerId,
+                List.of("search_code", "read_file", "load_code", "search_semantic", "build_context_pack")));
         workerService.register(new RegisterWorkerRequest(gptWorkerId, List.of("generate_explanation")));
 
         WorkflowResponse workflow = workflowService.createWorkflow(
@@ -230,10 +354,11 @@ class RepositoryWorkerExecutionIntegrationTest {
 
         ActionResponse searchAction = actionService.createAction(new CreateActionRequest(
                 workflow.id(),
-                "search_code",
+                "search_semantic",
                 objectMapper.writeValueAsString(Map.of(
                         "schemaVersion", "v1",
                         "query", "resource mapping",
+                        "topK", 5,
                         "scope", Map.of("paths", List.of(relativePath)))),
                 List.of(),
                 1,
@@ -243,12 +368,15 @@ class RepositoryWorkerExecutionIntegrationTest {
 
         ActionResponse analyzeAction = actionService.createAction(new CreateActionRequest(
                 workflow.id(),
-                "analyze_module",
+                "build_context_pack",
                 objectMapper.writeValueAsString(Map.of(
                         "schemaVersion", "v1",
                         "issue", "Explain why resource mapping fails",
+                        "query", "resource mapping",
                         "repo_context", "resource mapping subsystem",
-                        "file", relativePath)),
+                        "file", relativePath,
+                        "maxFiles", 2,
+                        "maxCharsPerFile", 1200)),
                 List.of(searchAction.id()),
                 1,
                 1,
@@ -270,8 +398,8 @@ class RepositoryWorkerExecutionIntegrationTest {
                 120
         ));
 
-        processAssignment(repositoryWorkerId, newRepositoryHandler(), "search_code");
-        processAssignment(repositoryWorkerId, newRepositoryHandler(), "analyze_module");
+        processAssignment(repositoryWorkerId, newRepositoryHandler(), "search_semantic");
+        processAssignment(repositoryWorkerId, newRepositoryHandler(), "build_context_pack");
         processAssignment(gptWorkerId, newGptHandler(), "generate_explanation");
 
         WorkflowExecutionResponse execution = workflowService.getWorkflowExecution(workflow.id());
@@ -338,7 +466,11 @@ class RepositoryWorkerExecutionIntegrationTest {
                 SchemaValidationMode.STRICT,
                 40,
                 65536,
-                List.of(".git", ".idea", ".aiflow", "target", "build", "node_modules"));
+                List.of(".git", ".idea", ".aiflow", "target", "build", "node_modules"),
+                5,
+                3,
+                4000,
+                null);
     }
 
     private GptWorkerActionHandler newGptHandler() {

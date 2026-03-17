@@ -257,8 +257,8 @@ Target flow:
 
 ```text
 issue
-  -> search_code
-  -> read_file
+  -> search_semantic
+  -> build_context_pack
   -> generate_explanation
 ```
 
@@ -291,8 +291,8 @@ Target flow:
 
 ```text
 issue
-  -> search_code
-  -> read_file
+  -> search_semantic
+  -> build_context_pack
   -> generate_explanation
   -> write_file
   -> run_tests
@@ -341,7 +341,7 @@ The system is no longer just a runtime skeleton. It now has six concrete layers:
 - Planner: issue -> plan preview
 - Runtime: workflow and action DAG execution
 - Worker: `generate_explanation`
-- Repository worker: `search_code`, `read_file`, and `analyze_module` compatibility via capability mapping
+- Repository worker: `search_code`, `read_file`, `search_semantic`, and `build_context_pack` (plus `analyze_module` compatibility)
 - CLI: `aiflow issue`, `aiflow plan`, `aiflow run`, `aiflow status`
 - Interactive CLI: `aiflow interactive`
 - Observability: workflow list, workflow status, action detail
@@ -365,8 +365,10 @@ Worker Milestone 1 is now implemented:
 
 - `search_code`
 - `read_file`
+- `search_semantic`
+- `build_context_pack`
 - planner-compatible `analyze_module -> read_file` capability mapping
-- execution contract tests proving `search_code -> analyze_module -> generate_explanation` can complete as a DAG
+- execution contract tests proving `search_semantic -> build_context_pack -> generate_explanation` can complete as a DAG
 
 Lease renewal observability baseline is now tracked per action:
 

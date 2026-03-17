@@ -15,6 +15,7 @@ Commands in this milestone:
 - `aiflow plan`
 - `aiflow run`
 - `aiflow status`
+- `aiflow summary`
 - `aiflow interactive`
 
 Scope boundary:
@@ -135,6 +136,11 @@ Submit plan file to runtime and create workflow/actions:
 aiflow run plan.json
 ```
 
+Default behavior:
+
+- stream workflow progress until `COMPLETED` or `FAILED`
+- then print workflow summary automatically
+
 Sample output:
 
 ```text
@@ -144,7 +150,20 @@ workflow_id: 2032...
 ✓ search_code
 ✓ analyze_module
 → generate_explanation
+
+Workflow 2032 completed
+
+Workflow Summary
+...
+Context Quality
+- retrievalCount: 5
+- noise: dependency directories detected
 ```
+
+Optional flags:
+
+- `--no-follow` (submit only, do not stream progress)
+- `--no-summary` (do not print summary after run)
 
 After submission, CLI writes local run metadata to:
 
@@ -183,6 +202,7 @@ Main menu:
 - new issue prompt -> plan preview -> run confirmation
 - recent workflow list
 - workflow status view
+- workflow summary view
 - action detail view
 - run plan file
 - settings editor (`runtime_url`, API keys)
@@ -191,6 +211,28 @@ Notes:
 
 - Interactive mode uses the same runtime APIs and local `.aiflow` files as non-interactive commands.
 - Running a workflow from interactive mode streams status updates until `COMPLETED` or `FAILED`.
+
+### 4.6 aiflow summary
+
+Show an aggregated summary for one workflow:
+
+```bash
+aiflow summary --workflow-id 2032
+```
+
+Or use latest workflow resolution (same behavior as `aiflow status`):
+
+```bash
+aiflow summary
+```
+
+Use `--json` for raw summary payload:
+
+```bash
+aiflow summary --workflow-id 2032 --json
+```
+
+Rendered summary includes `Context Quality` so you can quickly spot retrieval noise (for example, `.venv`/`site-packages` hits).
 
 ## 5. End-to-end Example
 
@@ -209,6 +251,7 @@ aiflow issue "Explain authentication module" --save plan.json
 aiflow plan plan.json
 aiflow run plan.json
 aiflow status
+aiflow summary
 aiflow interactive
 ```
 

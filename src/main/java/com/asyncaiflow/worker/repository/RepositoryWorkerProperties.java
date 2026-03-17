@@ -16,7 +16,10 @@ public class RepositoryWorkerProperties {
 
     private List<String> capabilities = new ArrayList<>(List.of(
             "search_code",
-            "read_file"
+            "read_file",
+            "load_code",
+            "search_semantic",
+            "build_context_pack"
     ));
 
     private long pollIntervalMillis = 2000L;
@@ -28,6 +31,8 @@ public class RepositoryWorkerProperties {
     private ValidationProperties validation = new ValidationProperties();
 
     private RepositoryProperties repository = new RepositoryProperties();
+
+    private SemanticProperties semantic = new SemanticProperties();
 
     public String getServerBaseUrl() {
         return serverBaseUrl;
@@ -91,6 +96,14 @@ public class RepositoryWorkerProperties {
 
     public void setRepository(RepositoryProperties repository) {
         this.repository = repository;
+    }
+
+    public SemanticProperties getSemantic() {
+        return semantic;
+    }
+
+    public void setSemantic(SemanticProperties semantic) {
+        this.semantic = semantic;
     }
 
     public static class ValidationProperties {
@@ -163,6 +176,107 @@ public class RepositoryWorkerProperties {
 
         public void setIgnoredDirectories(List<String> ignoredDirectories) {
             this.ignoredDirectories = ignoredDirectories == null ? new ArrayList<>() : new ArrayList<>(ignoredDirectories);
+        }
+    }
+
+    public static class SemanticProperties {
+
+        private int defaultTopK = 5;
+
+        private int maxContextFiles = 3;
+
+        private int maxCharsPerFile = 4000;
+
+        private ZreadProperties zread = new ZreadProperties();
+
+        public int getDefaultTopK() {
+            return defaultTopK;
+        }
+
+        public void setDefaultTopK(int defaultTopK) {
+            this.defaultTopK = defaultTopK;
+        }
+
+        public int getMaxContextFiles() {
+            return maxContextFiles;
+        }
+
+        public void setMaxContextFiles(int maxContextFiles) {
+            this.maxContextFiles = maxContextFiles;
+        }
+
+        public int getMaxCharsPerFile() {
+            return maxCharsPerFile;
+        }
+
+        public void setMaxCharsPerFile(int maxCharsPerFile) {
+            this.maxCharsPerFile = maxCharsPerFile;
+        }
+
+        public ZreadProperties getZread() {
+            return zread;
+        }
+
+        public void setZread(ZreadProperties zread) {
+            this.zread = zread;
+        }
+    }
+
+    public static class ZreadProperties {
+
+        private boolean enabled = false;
+
+        private String endpoint = "";
+
+        private String authorization = "";
+
+        private long timeoutMillis = 15000L;
+
+        private List<String> toolNames = new ArrayList<>(List.of(
+                "search_repo_semantic",
+                "search_semantic",
+                "semantic_search",
+                "search"
+        ));
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getEndpoint() {
+            return endpoint;
+        }
+
+        public void setEndpoint(String endpoint) {
+            this.endpoint = endpoint;
+        }
+
+        public String getAuthorization() {
+            return authorization;
+        }
+
+        public void setAuthorization(String authorization) {
+            this.authorization = authorization;
+        }
+
+        public long getTimeoutMillis() {
+            return timeoutMillis;
+        }
+
+        public void setTimeoutMillis(long timeoutMillis) {
+            this.timeoutMillis = timeoutMillis;
+        }
+
+        public List<String> getToolNames() {
+            return toolNames;
+        }
+
+        public void setToolNames(List<String> toolNames) {
+            this.toolNames = toolNames == null ? new ArrayList<>() : new ArrayList<>(toolNames);
         }
     }
 }

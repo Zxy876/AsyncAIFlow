@@ -23,6 +23,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import com.asyncaiflow.domain.entity.ActionEntity;
 import com.asyncaiflow.domain.entity.ActionLogEntity;
@@ -45,6 +46,8 @@ import com.asyncaiflow.web.dto.RegisterWorkerRequest;
 import com.asyncaiflow.web.dto.SubmitActionResultRequest;
 import com.asyncaiflow.web.dto.WorkflowResponse;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 @SpringBootTest(properties = {
         "spring.task.scheduling.enabled=false"
@@ -52,6 +55,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 @ActiveProfiles("local")
 @Import(SchedulerReliabilityIntegrationTest.QueueTestConfig.class)
 class SchedulerReliabilityIntegrationTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Autowired
     private WorkflowService workflowService;
@@ -336,6 +341,358 @@ class SchedulerReliabilityIntegrationTest {
         Optional<ActionAssignmentResponse> secondAssignment = actionService.pollAction("worker-downstream");
         assertTrue(secondAssignment.isPresent());
         assertEquals(downstream.id(), secondAssignment.get().actionId());
+    }
+
+    @Test
+    void dispatchAllRunnableActionsQueuesAllReadyFanOutNodes() {
+        registerWorker("worker-fanout-context", List.of("build_context_pack"));
+        registerWorker("worker-fanout-explain", List.of("generate_explanation"));
+        registerWorker("worker-fanout-review", List.of("review_code"));
+
+        WorkflowResponse workflow = createWorkflow("fanout-dispatch-flow");
+        ActionResponse upstreamA = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "search_semantic",
+            "{}",
+            List.of(),
+            1,
+            1,
+            120
+        ));
+        ActionResponse upstreamB = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "search_code",
+            "{}",
+            List.of(),
+            1,
+            1,
+            120
+        ));
+
+        ActionResponse downstreamContext = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "build_context_pack",
+            "{}",
+            List.of(upstreamA.id(), upstreamB.id()),
+            1,
+            1,
+            120
+        ));
+        ActionResponse downstreamExplain = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "generate_explanation",
+            "{}",
+            List.of(upstreamA.id(), upstreamB.id()),
+            1,
+            1,
+            120
+        ));
+        ActionResponse downstreamReview = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "review_code",
+            "{}",
+            List.of(upstreamA.id(), upstreamB.id()),
+            1,
+            1,
+            120
+        ));
+
+        ActionEntity upstreamAReloaded = actionMapper.selectById(upstreamA.id());
+        upstreamAReloaded.setStatus(ActionStatus.SUCCEEDED.name());
+        upstreamAReloaded.setUpdatedAt(LocalDateTime.now());
+        actionMapper.updateById(upstreamAReloaded);
+
+        ActionEntity upstreamBReloaded = actionMapper.selectById(upstreamB.id());
+        upstreamBReloaded.setStatus(ActionStatus.SUCCEEDED.name());
+        upstreamBReloaded.setUpdatedAt(LocalDateTime.now());
+        actionMapper.updateById(upstreamBReloaded);
+
+        int dispatched = actionService.dispatchAllRunnableActions();
+        assertEquals(3, dispatched);
+
+        ActionEntity downstreamContextReloaded = actionMapper.selectById(downstreamContext.id());
+        ActionEntity downstreamExplainReloaded = actionMapper.selectById(downstreamExplain.id());
+        ActionEntity downstreamReviewReloaded = actionMapper.selectById(downstreamReview.id());
+        assertEquals(ActionStatus.QUEUED.name(), downstreamContextReloaded.getStatus());
+        assertEquals(ActionStatus.QUEUED.name(), downstreamExplainReloaded.getStatus());
+        assertEquals(ActionStatus.QUEUED.name(), downstreamReviewReloaded.getStatus());
+
+        Optional<ActionAssignmentResponse> contextAssignment = actionService.pollAction("worker-fanout-context");
+        Optional<ActionAssignmentResponse> explainAssignment = actionService.pollAction("worker-fanout-explain");
+        Optional<ActionAssignmentResponse> reviewAssignment = actionService.pollAction("worker-fanout-review");
+
+        assertTrue(contextAssignment.isPresent());
+        assertTrue(explainAssignment.isPresent());
+        assertTrue(reviewAssignment.isPresent());
+
+        List<Long> assignedIds = List.of(
+            contextAssignment.get().actionId(),
+            explainAssignment.get().actionId(),
+            reviewAssignment.get().actionId()
+        );
+        assertTrue(assignedIds.contains(downstreamContext.id()));
+        assertTrue(assignedIds.contains(downstreamExplain.id()));
+        assertTrue(assignedIds.contains(downstreamReview.id()));
+
+        int secondDispatch = actionService.dispatchAllRunnableActions();
+        assertEquals(0, secondDispatch);
+    }
+
+    @Test
+    void dispatchRespectsPerWorkflowParallelLimit() {
+        registerWorker("worker-limit", List.of("generate_explanation"));
+
+        WorkflowResponse workflow = createWorkflow("limit-dispatch-flow");
+        ActionResponse upstream = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "search_semantic",
+            "{}",
+            List.of(),
+            1,
+            1,
+            120
+        ));
+
+        ActionResponse downstreamOne = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "generate_explanation",
+            "{}",
+            List.of(upstream.id()),
+            1,
+            1,
+            120
+        ));
+        ActionResponse downstreamTwo = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "generate_explanation",
+            "{}",
+            List.of(upstream.id()),
+            1,
+            1,
+            120
+        ));
+        ActionResponse downstreamThree = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "generate_explanation",
+            "{}",
+            List.of(upstream.id()),
+            1,
+            1,
+            120
+        ));
+
+        ActionEntity upstreamReloaded = actionMapper.selectById(upstream.id());
+        upstreamReloaded.setStatus(ActionStatus.SUCCEEDED.name());
+        upstreamReloaded.setUpdatedAt(LocalDateTime.now());
+        actionMapper.updateById(upstreamReloaded);
+
+        ReflectionTestUtils.setField(actionService, "maxParallelActionsPerWorkflow", 2);
+        try {
+            int firstDispatch = actionService.dispatchAllRunnableActions();
+            assertEquals(2, firstDispatch);
+
+            List<ActionEntity> firstStates = List.of(
+                actionMapper.selectById(downstreamOne.id()),
+                actionMapper.selectById(downstreamTwo.id()),
+                actionMapper.selectById(downstreamThree.id())
+            );
+            long queuedCount = firstStates.stream()
+                .filter(action -> ActionStatus.QUEUED.name().equals(action.getStatus()))
+                .count();
+            long blockedCount = firstStates.stream()
+                .filter(action -> ActionStatus.BLOCKED.name().equals(action.getStatus()))
+                .count();
+            assertEquals(2, queuedCount);
+            assertEquals(1, blockedCount);
+
+            Optional<ActionAssignmentResponse> firstAssignment = actionService.pollAction("worker-limit");
+            Optional<ActionAssignmentResponse> secondAssignment = actionService.pollAction("worker-limit");
+            assertTrue(firstAssignment.isPresent());
+            assertTrue(secondAssignment.isPresent());
+
+            actionService.submitResult(new SubmitActionResultRequest(
+                "worker-limit",
+                firstAssignment.get().actionId(),
+                "SUCCEEDED",
+                "ok",
+                null
+            ));
+
+            int secondDispatch = actionService.dispatchAllRunnableActions();
+            assertEquals(1, secondDispatch);
+
+            List<ActionEntity> secondStates = List.of(
+                actionMapper.selectById(downstreamOne.id()),
+                actionMapper.selectById(downstreamTwo.id()),
+                actionMapper.selectById(downstreamThree.id())
+            );
+            long blockedAfterSecondDispatch = secondStates.stream()
+                .filter(action -> ActionStatus.BLOCKED.name().equals(action.getStatus()))
+                .count();
+            long inflightAfterSecondDispatch = secondStates.stream()
+                .filter(action -> ActionStatus.QUEUED.name().equals(action.getStatus())
+                    || ActionStatus.RUNNING.name().equals(action.getStatus()))
+                .count();
+            assertEquals(0, blockedAfterSecondDispatch);
+            assertEquals(2, inflightAfterSecondDispatch);
+        } finally {
+            ReflectionTestUtils.setField(actionService, "maxParallelActionsPerWorkflow", 0);
+        }
+    }
+
+    @Test
+    void pollMaterializesInjectPayloadFromUpstreamResults() throws Exception {
+        registerWorker("worker-semantic", List.of("search_semantic"));
+        registerWorker("worker-context", List.of("build_context_pack"));
+        WorkflowResponse workflow = createWorkflow("injection-flow");
+
+        ActionResponse upstream = actionService.createAction(new CreateActionRequest(
+                workflow.id(),
+                "search_semantic",
+                objectMapper.writeValueAsString(java.util.Map.of(
+                        "schemaVersion", "v1",
+                        "query", "resource mapping"
+                )),
+                List.of(),
+                1,
+                1,
+                120
+        ));
+
+        ActionResponse downstream = actionService.createAction(new CreateActionRequest(
+                workflow.id(),
+                "build_context_pack",
+                objectMapper.writeValueAsString(java.util.Map.of(
+                        "schemaVersion", "v1",
+                        "issue", "Explain resource mapping flow",
+                        "query", "resource mapping",
+                        "inject", java.util.Map.of(
+                                "retrievalResults", "$upstream[0].result.matches"
+                        )
+                )),
+                List.of(upstream.id()),
+                1,
+                1,
+                120
+        ));
+
+        ActionEntity upstreamRunning = actionMapper.selectById(upstream.id());
+        upstreamRunning.setStatus(ActionStatus.RUNNING.name());
+        upstreamRunning.setWorkerId("worker-semantic");
+        upstreamRunning.setLeaseExpireAt(LocalDateTime.now().plusSeconds(60));
+        upstreamRunning.setUpdatedAt(LocalDateTime.now());
+        actionMapper.updateById(upstreamRunning);
+
+        String upstreamResult = objectMapper.writeValueAsString(java.util.Map.of(
+                "schemaVersion", "v1",
+                "worker", "repository-worker",
+                "query", "resource mapping",
+                "engine", "local_fallback",
+                "matchCount", 1,
+                "matches", java.util.List.of(java.util.Map.of(
+                        "path", "docs/architecture.md",
+                        "score", 0.92,
+                        "chunk", "resource mapping behavior",
+                        "lineNumber", 12,
+                        "source", "local_semantic"
+                ))
+        ));
+
+        actionService.submitResult(new SubmitActionResultRequest(
+                "worker-semantic",
+                upstream.id(),
+                "SUCCEEDED",
+                upstreamResult,
+                null
+        ));
+
+        Optional<ActionAssignmentResponse> assignment = actionService.pollAction("worker-context");
+        assertTrue(assignment.isPresent());
+        assertEquals(downstream.id(), assignment.get().actionId());
+
+        JsonNode payload = objectMapper.readTree(assignment.get().payload());
+        assertTrue(payload.path("inject").isMissingNode());
+        assertEquals(1, payload.path("retrievalResults").size());
+        assertEquals("docs/architecture.md", payload.path("retrievalResults").get(0).path("path").asText());
+
+        ActionEntity storedDownstream = actionMapper.selectById(downstream.id());
+        JsonNode storedPayload = objectMapper.readTree(storedDownstream.getPayload());
+        assertTrue(storedPayload.path("inject").isObject());
+    }
+
+    @Test
+    void pollMaterializesInjectPayloadUsingFallbackFromExpression() throws Exception {
+        registerWorker("worker-semantic-fallback", List.of("search_semantic"));
+        registerWorker("worker-review-fallback", List.of("review_code"));
+        WorkflowResponse workflow = createWorkflow("injection-fallback-flow");
+
+        ActionResponse upstream = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "search_semantic",
+            objectMapper.writeValueAsString(java.util.Map.of(
+                "schemaVersion", "v1",
+                "query", "scene runtime"
+            )),
+            List.of(),
+            1,
+            1,
+            120
+        ));
+
+        ActionResponse downstream = actionService.createAction(new CreateActionRequest(
+            workflow.id(),
+            "review_code",
+            objectMapper.writeValueAsString(java.util.Map.of(
+                "schemaVersion", "v1",
+                "focus", "runtime abstraction",
+                "inject", java.util.Map.of(
+                    "code", java.util.Map.of(
+                        "from", "$upstream[0].result.sources[0].content",
+                        "fallbackFrom", java.util.List.of("$upstream[0].result.retrieval[0].chunk")
+                    )
+                )
+            )),
+            List.of(upstream.id()),
+            1,
+            1,
+            120
+        ));
+
+        ActionEntity upstreamRunning = actionMapper.selectById(upstream.id());
+        upstreamRunning.setStatus(ActionStatus.RUNNING.name());
+        upstreamRunning.setWorkerId("worker-semantic-fallback");
+        upstreamRunning.setLeaseExpireAt(LocalDateTime.now().plusSeconds(60));
+        upstreamRunning.setUpdatedAt(LocalDateTime.now());
+        actionMapper.updateById(upstreamRunning);
+
+        String upstreamResult = objectMapper.writeValueAsString(java.util.Map.of(
+            "schemaVersion", "v1",
+            "worker", "repository-worker",
+            "query", "scene runtime",
+            "engine", "local_fallback",
+            "matchCount", 1,
+            "retrieval", java.util.List.of(java.util.Map.of(
+                "path", "plugin/src/main/java/com/driftmc/story/SceneRuntime.java",
+                "score", 0.93,
+                "chunk", "public final class SceneRuntime {"
+            ))
+        ));
+
+        actionService.submitResult(new SubmitActionResultRequest(
+            "worker-semantic-fallback",
+            upstream.id(),
+            "SUCCEEDED",
+            upstreamResult,
+            null
+        ));
+
+        Optional<ActionAssignmentResponse> assignment = actionService.pollAction("worker-review-fallback");
+        assertTrue(assignment.isPresent());
+        assertEquals(downstream.id(), assignment.get().actionId());
+
+        JsonNode payload = objectMapper.readTree(assignment.get().payload());
+        assertTrue(payload.path("inject").isMissingNode());
+        assertEquals("public final class SceneRuntime {", payload.path("code").asText());
     }
 
     @Test
