@@ -1,0 +1,10 @@
+{
+  "inputType": "TEXT",
+  "prompt": "把这件旧衣服改造成赛博朋克风机能背心，增加立体口袋与可拆卸领部模块",
+  "rawScanUrl": "/Users/zxydediannao/AIWorkspace/ AsyncAIFlow/python-workers/scan_processing_worker/.venv/lib/python3.14/site-packages/pymeshlab/tests/sample_meshes/bunny.obj",
+  "options": {
+    "style": "cyberpunk functional vest",
+    "fabricWidthMm": 1500,
+    "gapMm": 10
+  }
+}

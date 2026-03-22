@@ -14,6 +14,16 @@ RUN_SUFFIX="$(date +%s)-$$"
 REPOSITORY_WORKER_ID="${ASYNCAIFLOW_REPOSITORY_WORKER_ID:-repository-worker-dev-${RUN_SUFFIX}}"
 GIT_WORKER_ID="${ASYNCAIFLOW_GIT_WORKER_ID:-git-worker-dev-${RUN_SUFFIX}}"
 GPT_WORKER_ID="${ASYNCAIFLOW_GPT_WORKER_ID:-gpt-worker-dev-${RUN_SUFFIX}}"
+DESIGN_GPT_WORKER_ID="${ASYNCAIFLOW_DESIGN_GPT_WORKER_ID:-design-gpt-worker-py}"
+DESIGN_GPT_WORKER_DIR="${PROJECT_ROOT}/python-workers/design_gpt_worker"
+BFS_TOPOLOGY_WORKER_ID="${ASYNCAIFLOW_BFS_TOPOLOGY_WORKER_ID:-bfs-topology-worker-py}"
+BFS_TOPOLOGY_WORKER_DIR="${PROJECT_ROOT}/python-workers/bfs_topology_worker"
+DP_NESTING_WORKER_ID="${ASYNCAIFLOW_DP_NESTING_WORKER_ID:-dp-nesting-worker-py}"
+DP_NESTING_WORKER_DIR="${PROJECT_ROOT}/python-workers/dp_nesting_worker"
+SCAN_PROCESSING_WORKER_ID="${ASYNCAIFLOW_SCAN_PROCESSING_WORKER_ID:-scan-processing-worker-py}"
+SCAN_PROCESSING_WORKER_DIR="${PROJECT_ROOT}/python-workers/scan_processing_worker"
+ASSEMBLY_WORKER_ID="${ASYNCAIFLOW_ASSEMBLY_WORKER_ID:-assembly-worker-py}"
+ASSEMBLY_WORKER_DIR="${PROJECT_ROOT}/python-workers/assembly_worker"
 LAST_STARTED_PID=""
 LAST_STARTED_LOG_FILE=""
 
@@ -89,40 +99,30 @@ PY
 }
 
 load_llm_environment() {
-  if [[ -z "${OPENAI_BASE_URL:-}" ]]; then
-    OPENAI_BASE_URL="$(read_config_value llm_base_url)"
-    export OPENAI_BASE_URL
-  fi
-
-  if [[ -z "${OPENAI_ENDPOINT:-}" ]]; then
-    OPENAI_ENDPOINT="$(read_config_value llm_endpoint)"
-    export OPENAI_ENDPOINT
-  fi
-
-  if [[ -z "${OPENAI_MODEL:-}" ]]; then
-    OPENAI_MODEL="$(read_config_value llm_model)"
-    export OPENAI_MODEL
-  fi
-
-  if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    OPENAI_API_KEY="$(read_config_value llm_api_key)"
-    if [[ -z "${OPENAI_API_KEY}" ]]; then
-      OPENAI_API_KEY="$(read_config_value openai_api_key)"
+  if [[ -z "${GEMINI_MODEL:-}" ]]; then
+    GEMINI_MODEL="$(read_config_value gemini_model)"
+    if [[ -z "${GEMINI_MODEL}" ]]; then
+      GEMINI_MODEL="$(read_config_value llm_model)"
     fi
-    export OPENAI_API_KEY
+    if [[ -z "${GEMINI_MODEL}" ]]; then
+      GEMINI_MODEL="gemini-2.5-flash"
+    fi
+    export GEMINI_MODEL
   fi
 
-  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
-    printf '[dev-start] llm base url: %s\n' "${OPENAI_BASE_URL}"
+  if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+    GEMINI_API_KEY="$(read_config_value gemini_api_key)"
+    if [[ -z "${GEMINI_API_KEY}" ]]; then
+      GEMINI_API_KEY="$(read_config_value llm_api_key)"
+    fi
+    export GEMINI_API_KEY
   fi
-  if [[ -n "${OPENAI_ENDPOINT:-}" ]]; then
-    printf '[dev-start] llm endpoint: %s\n' "${OPENAI_ENDPOINT}"
+
+  if [[ -n "${GEMINI_MODEL:-}" ]]; then
+    printf '[dev-start] gemini model: %s\n' "${GEMINI_MODEL}"
   fi
-  if [[ -n "${OPENAI_MODEL:-}" ]]; then
-    printf '[dev-start] llm model: %s\n' "${OPENAI_MODEL}"
-  fi
-  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-    printf '[dev-start] llm api key detected\n'
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    printf '[dev-start] gemini api key detected\n'
   fi
 }
 
@@ -329,6 +329,142 @@ if ! wait_for_worker_registration gpt-worker "${GPT_WORKER_ID}" "${gpt_worker_pi
   exit 1
 fi
 
+# ── Design GPT Worker (Python) ──────────────────────────────────────────────
+# Handles nl_to_design_dsl actions. Requires GEMINI_API_KEY and a virtualenv
+# at python-workers/design_gpt_worker/.venv (run `python3 -m venv .venv &&
+# pip install -r requirements.txt` once to create it).
+if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+  printf '[dev-start] GEMINI_API_KEY not set — skipping design-gpt-worker (Python).\n'
+  printf '[dev-start] nl_to_design_dsl tasks will stall. Set GEMINI_API_KEY or add it to .aiflow/config.json.\n'
+elif [[ ! -f "${DESIGN_GPT_WORKER_DIR}/.venv/bin/python3" ]]; then
+  printf '[dev-start] design-gpt-worker venv not found at %s/.venv — skipping.\n' "${DESIGN_GPT_WORKER_DIR}"
+  printf '[dev-start] Run: cd %s && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n' "${DESIGN_GPT_WORKER_DIR}"
+else
+  start_process design-gpt-worker \
+    env \
+      "ASYNCAIFLOW_WORKER_ID=${DESIGN_GPT_WORKER_ID}" \
+      "ASYNCAIFLOW_SERVER_BASE_URL=${RUNTIME_URL}" \
+      "GEMINI_API_KEY=${GEMINI_API_KEY}" \
+      "GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}" \
+    "${DESIGN_GPT_WORKER_DIR}/.venv/bin/python3" "${DESIGN_GPT_WORKER_DIR}/worker.py"
+
+  design_gpt_worker_pid="${LAST_STARTED_PID}"
+  design_gpt_worker_log="${LAST_STARTED_LOG_FILE}"
+
+  if ! wait_for_worker_registration design-gpt-worker "${DESIGN_GPT_WORKER_ID}" "${design_gpt_worker_pid}" "${design_gpt_worker_log}"; then
+    printf '[dev-start] warning: design-gpt-worker did not register. Check %s\n' "${LOG_DIR}/design-gpt-worker.log" >&2
+    printf '[dev-start] continuing — nl_to_design_dsl tasks will stall until worker comes online.\n' >&2
+  else
+    printf '[dev-start] design-gpt-worker registered as %s\n' "${DESIGN_GPT_WORKER_ID}"
+  fi
+fi
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── BFS Topology Worker (Python) ─────────────────────────────────────────────
+# Handles topology_validate actions (phase 2 of the design DAG).
+# No LLM key required — pure graph analysis using networkx.
+# Requires a virtualenv at python-workers/bfs_topology_worker/.venv
+# (run `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` once).
+if [[ ! -f "${BFS_TOPOLOGY_WORKER_DIR}/.venv/bin/python3" ]]; then
+  printf '[dev-start] bfs-topology-worker venv not found at %s/.venv — skipping.\n' "${BFS_TOPOLOGY_WORKER_DIR}"
+  printf '[dev-start] Run: cd %s && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n' "${BFS_TOPOLOGY_WORKER_DIR}"
+else
+  start_process bfs-topology-worker \
+    env \
+      "ASYNCAIFLOW_WORKER_ID=${BFS_TOPOLOGY_WORKER_ID}" \
+      "ASYNCAIFLOW_SERVER_BASE_URL=${RUNTIME_URL}" \
+    "${BFS_TOPOLOGY_WORKER_DIR}/.venv/bin/python3" "${BFS_TOPOLOGY_WORKER_DIR}/worker.py"
+
+  bfs_topology_worker_pid="${LAST_STARTED_PID}"
+  bfs_topology_worker_log="${LAST_STARTED_LOG_FILE}"
+
+  if ! wait_for_worker_registration bfs-topology-worker "${BFS_TOPOLOGY_WORKER_ID}" "${bfs_topology_worker_pid}" "${bfs_topology_worker_log}"; then
+    printf '[dev-start] warning: bfs-topology-worker did not register. Check %s\n' "${LOG_DIR}/bfs-topology-worker.log" >&2
+    printf '[dev-start] continuing — topology_validate actions will stall until worker comes online.\n' >&2
+  else
+    printf '[dev-start] bfs-topology-worker registered as %s\n' "${BFS_TOPOLOGY_WORKER_ID}"
+  fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DP Nesting Worker (Python) ───────────────────────────────────────────────
+# Handles dp_nesting actions (phase 3 of the design DAG).
+# Requires a virtualenv at python-workers/dp_nesting_worker/.venv
+# (run `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` once).
+if [[ ! -f "${DP_NESTING_WORKER_DIR}/.venv/bin/python3" ]]; then
+  printf '[dev-start] dp-nesting-worker venv not found at %s/.venv — skipping.\n' "${DP_NESTING_WORKER_DIR}"
+  printf '[dev-start] Run: cd %s && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n' "${DP_NESTING_WORKER_DIR}"
+else
+  start_process dp-nesting-worker \
+    env \
+      "ASYNCAIFLOW_WORKER_ID=${DP_NESTING_WORKER_ID}" \
+      "ASYNCAIFLOW_SERVER_BASE_URL=${RUNTIME_URL}" \
+    "${DP_NESTING_WORKER_DIR}/.venv/bin/python3" "${DP_NESTING_WORKER_DIR}/worker.py"
+
+  dp_nesting_worker_pid="${LAST_STARTED_PID}"
+  dp_nesting_worker_log="${LAST_STARTED_LOG_FILE}"
+
+  if ! wait_for_worker_registration dp-nesting-worker "${DP_NESTING_WORKER_ID}" "${dp_nesting_worker_pid}" "${dp_nesting_worker_log}"; then
+    printf '[dev-start] warning: dp-nesting-worker did not register. Check %s\n' "${LOG_DIR}/dp-nesting-worker.log" >&2
+    printf '[dev-start] continuing — dp_nesting actions will stall until worker comes online.\n' >&2
+  else
+    printf '[dev-start] dp-nesting-worker registered as %s\n' "${DP_NESTING_WORKER_ID}"
+  fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Scan Processing Worker (Python) ─────────────────────────────────────────
+# Handles process_raw_scan actions for cleaning photogrammetry / LiDAR meshes.
+# Requires a virtualenv at python-workers/scan_processing_worker/.venv
+# (run `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` once).
+if [[ ! -f "${SCAN_PROCESSING_WORKER_DIR}/.venv/bin/python3" ]]; then
+  printf '[dev-start] scan-processing-worker venv not found at %s/.venv — skipping.\n' "${SCAN_PROCESSING_WORKER_DIR}"
+  printf '[dev-start] Run: cd %s && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n' "${SCAN_PROCESSING_WORKER_DIR}"
+else
+  start_process scan-processing-worker \
+    env \
+      "ASYNCAIFLOW_WORKER_ID=${SCAN_PROCESSING_WORKER_ID}" \
+      "ASYNCAIFLOW_SERVER_BASE_URL=${RUNTIME_URL}" \
+    "${SCAN_PROCESSING_WORKER_DIR}/.venv/bin/python3" "${SCAN_PROCESSING_WORKER_DIR}/worker.py"
+
+  scan_processing_worker_pid="${LAST_STARTED_PID}"
+  scan_processing_worker_log="${LAST_STARTED_LOG_FILE}"
+
+  if ! wait_for_worker_registration scan-processing-worker "${SCAN_PROCESSING_WORKER_ID}" "${scan_processing_worker_pid}" "${scan_processing_worker_log}"; then
+    printf '[dev-start] warning: scan-processing-worker did not register. Check %s\n' "${LOG_DIR}/scan-processing-worker.log" >&2
+    printf '[dev-start] continuing — process_raw_scan actions will stall until worker comes online.\n' >&2
+  else
+    printf '[dev-start] scan-processing-worker registered as %s\n' "${SCAN_PROCESSING_WORKER_ID}"
+  fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Assembly Worker (Python) ────────────────────────────────────────────────
+# Handles 3d_assembly_render actions for base-garment + module scene assembly.
+# Requires a virtualenv at python-workers/assembly_worker/.venv
+# (run `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` once).
+if [[ ! -f "${ASSEMBLY_WORKER_DIR}/.venv/bin/python3" ]]; then
+  printf '[dev-start] assembly-worker venv not found at %s/.venv — skipping.\n' "${ASSEMBLY_WORKER_DIR}"
+  printf '[dev-start] Run: cd %s && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n' "${ASSEMBLY_WORKER_DIR}"
+else
+  start_process assembly-worker \
+    env \
+      "ASYNCAIFLOW_WORKER_ID=${ASSEMBLY_WORKER_ID}" \
+      "ASYNCAIFLOW_SERVER_BASE_URL=${RUNTIME_URL}" \
+    "${ASSEMBLY_WORKER_DIR}/.venv/bin/python3" "${ASSEMBLY_WORKER_DIR}/worker.py"
+
+  assembly_worker_pid="${LAST_STARTED_PID}"
+  assembly_worker_log="${LAST_STARTED_LOG_FILE}"
+
+  if ! wait_for_worker_registration assembly-worker "${ASSEMBLY_WORKER_ID}" "${assembly_worker_pid}" "${assembly_worker_log}"; then
+    printf '[dev-start] warning: assembly-worker did not register. Check %s\n' "${LOG_DIR}/assembly-worker.log" >&2
+    printf '[dev-start] continuing — 3d_assembly_render actions will stall until worker comes online.\n' >&2
+  else
+    printf '[dev-start] assembly-worker registered as %s\n' "${ASSEMBLY_WORKER_ID}"
+  fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 printf '[dev-start] all services started in background\n'
 printf '[dev-start] logs directory: %s\n' "${LOG_DIR}"
 printf '[dev-start] mysql host port: %s (container:3306)\n' "${MYSQL_HOST_PORT}"
@@ -336,6 +472,11 @@ printf '[dev-start] datasource url: %s\n' "${RUNTIME_DB_URL}"
 printf '[dev-start] repository worker id: %s\n' "${REPOSITORY_WORKER_ID}"
 printf '[dev-start] git worker id: %s\n' "${GIT_WORKER_ID}"
 printf '[dev-start] gpt worker id: %s\n' "${GPT_WORKER_ID}"
+printf '[dev-start] design-gpt-worker id: %s\n' "${DESIGN_GPT_WORKER_ID}"
+printf '[dev-start] bfs-topology-worker id: %s\n' "${BFS_TOPOLOGY_WORKER_ID}"
+printf '[dev-start] dp-nesting-worker id: %s\n' "${DP_NESTING_WORKER_ID}"
+printf '[dev-start] scan-processing-worker id: %s\n' "${SCAN_PROCESSING_WORKER_ID}"
+printf '[dev-start] assembly-worker id: %s\n' "${ASSEMBLY_WORKER_ID}"
 printf '[dev-start] press Ctrl+C to stop runtime, workers, and docker services\n'
 
 while true; do

@@ -17,7 +17,12 @@ matches_asyncaiflow_process() {
     [[ "${command}" == *"com.asyncaiflow.worker.repository.RepositoryWorkerApplication"* ]] || \
     [[ "${command}" == *"com.asyncaiflow.worker.gpt.GptWorkerApplication"* ]] || \
     [[ "${command}" == *"com.asyncaiflow.worker.git.GitWorkerApplication"* ]] || \
-    [[ "${command}" == *"com.asyncaiflow.worker.planner.PlannerWorkerApplication"* ]]; then
+    [[ "${command}" == *"com.asyncaiflow.worker.planner.PlannerWorkerApplication"* ]] || \
+    [[ "${command}" == *"design_gpt_worker/worker.py"* ]] || \
+    [[ "${command}" == *"bfs_topology_worker/worker.py"* ]] || \
+    [[ "${command}" == *"dp_nesting_worker/worker.py"* ]] || \
+    [[ "${command}" == *"scan_processing_worker/worker.py"* ]] || \
+    [[ "${command}" == *"assembly_worker/worker.py"* ]]; then
     return 0
   fi
 

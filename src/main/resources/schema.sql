@@ -72,6 +72,37 @@ CREATE TABLE IF NOT EXISTS action_log (
     INDEX idx_action_log_action (action_id)
 );
 
+CREATE TABLE IF NOT EXISTS design_task (
+    id VARCHAR(64) PRIMARY KEY,
+    workflow_id BIGINT NULL,
+    status VARCHAR(32) NOT NULL,
+    input_type VARCHAR(32) NOT NULL,
+    prompt_text TEXT NULL,
+    design_image_url VARCHAR(512) NULL,
+    progress INT NOT NULL DEFAULT 0,
+    stage_label VARCHAR(128) NULL,
+    result_model_url VARCHAR(512) NULL,
+    result_thumbnail_url VARCHAR(512) NULL,
+    error_code VARCHAR(64) NULL,
+    error_message TEXT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    finished_at DATETIME NULL,
+    INDEX idx_design_task_workflow_id (workflow_id),
+    INDEX idx_design_task_status (status),
+    INDEX idx_design_task_created_at (created_at)
+);
+
+SET @ddl = IF(
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'design_task' AND COLUMN_NAME = 'workflow_id') = 0,
+    'ALTER TABLE design_task ADD COLUMN workflow_id BIGINT NULL',
+    'SELECT 1'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
 SET @ddl = IF(
     (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'action' AND COLUMN_NAME = 'max_retry_count') = 0,

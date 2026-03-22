@@ -19,6 +19,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import com.asyncaiflow.domain.entity.ActionDependencyEntity;
 import com.asyncaiflow.domain.entity.ActionEntity;
@@ -161,12 +163,12 @@ public class ActionService {
         }
 
         if (upstreamActionIds.isEmpty()) {
-            actionQueueService.enqueue(action, requiredCapability);
+            enqueueAction(action, requiredCapability);
         } else if (allDependenciesSucceeded(action.getId())) {
             transitionState(action, ActionStatus.QUEUED);
             action.setUpdatedAt(LocalDateTime.now());
             actionMapper.updateById(action);
-            actionQueueService.enqueue(action, requiredCapability);
+            enqueueAction(action, requiredCapability);
         }
 
         workflowService.refreshStatus(workflow.getId());
@@ -401,7 +403,7 @@ public class ActionService {
             latest.setNextRunAt(null);
             latest.setUpdatedAt(now);
             actionMapper.updateById(latest);
-                actionQueueService.enqueue(
+            enqueueAction(
                     latest,
                     actionCapabilityResolver.resolveRequiredCapability(latest.getType()));
             impactedWorkflows.add(latest.getWorkflowId());
@@ -1078,7 +1080,7 @@ public class ActionService {
                 continue;
             }
 
-            actionQueueService.enqueue(
+                enqueueAction(
                     downstreamAction,
                     actionCapabilityResolver.resolveRequiredCapability(downstreamAction.getType()));
             consumeDispatchSlot(workflowId, remainingSlotsByWorkflow);
@@ -1200,6 +1202,20 @@ public class ActionService {
             return false;
         }
         return findDependencySatisfiedActionIds(Set.of(downstreamActionId)).contains(downstreamActionId);
+    }
+
+    private void enqueueAction(ActionEntity action, String capability) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    actionQueueService.enqueue(action, capability);
+                }
+            });
+            return;
+        }
+
+        actionQueueService.enqueue(action, capability);
     }
 
     private List<Long> loadUpstreamActionIds(Long actionId) {
