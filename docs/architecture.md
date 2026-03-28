@@ -8,25 +8,32 @@ It schedules Action instances instead of scheduling agents directly.
 
 High-level architecture:
 
-```text
-Human Workflow
-      |
-      v
-Action Graph (DAG)
-      |
-      v
-AsyncAIFlow Scheduler Core
-      |
-      +--> MySQL (durable metadata)
-      |
-      +--> Redis (queue and lock coordination)
-      |
-      v
-Worker SDK Protocol (HTTP)
-      |
-      +--> TestWorker
-      +--> GPTWorker
-      +--> future workers (Zread, Copilot, ...)
+```mermaid
+graph TD
+    Dev["👨‍💻 Developer / CLI"]
+    API["Flow API (REST)\n/workflow /action /worker /planner"]
+    Planner["Planner\nNL → Action Plan"]
+    Scheduler["AsyncAIFlow Scheduler Core\nActionService · WorkflowService · WorkerService\nSchedulerMaintenanceService"]
+    Redis["Redis\n─────────────\naction:queue:{type}\naction:lock:{actionId}\nworker:heartbeat:{workerId}"]
+    MySQL["MySQL\n─────────────\nworkflow\naction\nworker\naction_dependency\naction_log"]
+    WorkerPool["Worker Pool"]
+    TestWorker["🔧 TestWorker\ntest_action"]
+    GPTWorker["🤖 GPT Worker\ndesign_solution · review_code"]
+    RepoWorker["📁 Repository Worker\nsearch_code · read_file\nsearch_semantic · build_context_pack\nload_code · analyze_module"]
+    PlannerWorker["📋 Planner Worker\nplan_workflow"]
+    GitWorker["🗂 Git Worker\ngit operations"]
+
+    Dev -->|"HTTP / aiflow CLI"| API
+    API --> Planner
+    API --> Scheduler
+    Scheduler -->|"enqueue · claim · lock · heartbeat"| Redis
+    Scheduler -->|"read / write metadata & logs"| MySQL
+    Scheduler -->|"HTTP poll / submit / renew-lease"| WorkerPool
+    WorkerPool --- TestWorker
+    WorkerPool --- GPTWorker
+    WorkerPool --- RepoWorker
+    WorkerPool --- PlannerWorker
+    WorkerPool --- GitWorker
 ```
 
 Current system status:
@@ -67,6 +74,30 @@ Design boundary:
 ## 3. Action Model
 
 Action is the smallest schedulable execution unit.
+
+Action state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> BLOCKED : created with unresolved dependencies
+    [*] --> QUEUED  : created with no dependencies
+
+    BLOCKED    --> QUEUED      : upstream action succeeds (downstream activation)
+    QUEUED     --> RUNNING     : worker polls and acquires lease
+    RUNNING    --> SUCCEEDED   : worker submits success result
+    RUNNING    --> RETRY_WAIT  : worker submits failure (retries available)\nor lease expires (retries available)
+    RUNNING    --> DEAD_LETTER : lease expires (retries exhausted)
+    RETRY_WAIT --> QUEUED      : next_run_at reached (enqueue due retries)
+    RETRY_WAIT --> DEAD_LETTER : retry budget exhausted
+
+    SUCCEEDED  --> [*]
+    DEAD_LETTER --> [*]
+
+    note right of RUNNING
+        Lease renewed periodically
+        by worker SDK (every 10s)
+    end note
+```
 
 Typical action states:
 
@@ -117,15 +148,52 @@ Endpoints:
 
 Worker loop contract:
 
-```text
-startup
-  -> register
-  -> loop:
-       heartbeat (periodic)
-       poll
-       execute
-      renewLease (periodic while executing)
-       submitResult
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant S as Flow Server (Scheduler)
+    participant R as Redis
+    participant DB as MySQL
+
+    W->>S: POST /worker/register (capabilities)
+    S->>DB: insert WorkerEntity
+
+    loop Every ~30s
+        W->>S: POST /worker/heartbeat
+        S->>R: SET worker:heartbeat:{workerId} TTL
+    end
+
+    loop Poll cycle
+        W->>S: GET /action/poll?workerId=...
+        S->>R: LPOP action:queue:{type} + SET action:lock:{actionId}
+        S->>DB: UPDATE action SET status=RUNNING, worker_id=..., lease_expire_at=...
+        S-->>W: ActionAssignmentResponse (actionId, type, payload)
+
+        par Lease renewal (background thread)
+            loop Every 10s while executing
+                W->>S: POST /action/{actionId}/renew-lease
+                S->>R: EXPIRE action:lock:{actionId} (extend TTL)
+            end
+        end
+
+        W->>W: execute action (LLM call / code search / git op)
+
+        alt Success
+            W->>S: POST /action/result (status=SUCCEEDED, result=...)
+            S->>DB: UPDATE action SET status=SUCCEEDED
+            S->>R: DEL action:lock:{actionId}
+            S->>DB: INSERT action_log
+            S->>S: triggerDownstreamActions()
+        else Failure
+            W->>S: POST /action/result (status=FAILED, errorMessage=...)
+            alt retries available
+                S->>DB: UPDATE action SET status=RETRY_WAIT, next_run_at=...
+            else retries exhausted
+                S->>DB: UPDATE action SET status=DEAD_LETTER
+            end
+            S->>R: DEL action:lock:{actionId}
+        end
+    end
 ```
 
 Protocol guarantees:
@@ -173,8 +241,14 @@ Behavior:
 
 AI worker model in AsyncAIFlow:
 
-```text
-poll action -> build prompt/context -> call model/toolchain -> submit result
+```mermaid
+flowchart LR
+    Poll["Poll action\n(GET /action/poll)"]
+    Context["Build prompt / context\n(payload + retrieval results)"]
+    Model["Call model / toolchain\n(LLM · search · git)"]
+    Submit["Submit result\n(POST /action/result)"]
+
+    Poll --> Context --> Model --> Submit --> Poll
 ```
 
 Separation of concerns:
@@ -233,6 +307,79 @@ Recommended non-goals for current stage:
 - multi-tenant and RBAC expansion
 
 These should wait until scheduler-worker stability is proven over longer-running workloads.
+
+## Appendix: Internal Component Dependency Graph
+
+Server-side component relationships:
+
+```mermaid
+graph TD
+    App["AsyncAiFlowApplication\n(Spring Boot entry point)"]
+
+    subgraph Controllers
+        AC["ActionController"]
+        WFC["WorkflowController"]
+        WRC["WorkerController"]
+        PC["PlannerController"]
+        WLC["WorkflowListController"]
+    end
+
+    subgraph Services
+        AS["ActionService\n(core orchestration)"]
+        WFS["WorkflowService"]
+        WRS["WorkerService"]
+        PS["PlannerService"]
+        SMS["SchedulerMaintenanceService\n(scheduled loops every 2s)"]
+        AQS["ActionQueueService\n(Redis operations)"]
+        ACR["ActionCapabilityResolver\n(type → capability)"]
+    end
+
+    subgraph Mappers
+        AM["ActionMapper"]
+        WFM["WorkflowMapper"]
+        WRM["WorkerMapper"]
+        ALM["ActionLogMapper"]
+        ADM["ActionDependencyMapper"]
+    end
+
+    subgraph Storage
+        REDIS["Redis"]
+        MYSQL["MySQL"]
+    end
+
+    App --> Controllers
+    App --> Services
+
+    AC --> AS
+    WFC --> WFS
+    WRC --> WRS
+    PC --> PS
+    WLC --> WFS
+
+    AS --> AQS
+    AS --> ACR
+    AS --> WFS
+    AS --> WRS
+    AS --> AM
+    AS --> ALM
+    AS --> ADM
+
+    WFS --> WFM
+    WFS --> AM
+
+    WRS --> WRM
+    WRS --> AQS
+
+    SMS --> AS
+    SMS --> WRS
+
+    AQS --> REDIS
+    AM --> MYSQL
+    WFM --> MYSQL
+    WRM --> MYSQL
+    ALM --> MYSQL
+    ADM --> MYSQL
+```
 
 ## Appendix: Architectural Invariants
 
